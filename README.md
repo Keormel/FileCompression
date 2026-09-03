@@ -32,6 +32,21 @@ CLI показывает размеры, коэффициент сжатия, э
 
 Сервер и клиентский API находятся в `src/filecompression/transfer`. Сервер поддерживает именованных пользователей, принимает контейнер от отправителя и помещает его во входящую очередь получателя. Используется TCP с 4-байтным big-endian размером каждого фрейма.
 
+## Web interface
+
+Соберите React UI и запустите FastAPI Web server:
+
+```text
+cd frontend
+npm install
+npm run build
+cd ..
+.venv\Scripts\python.exe -m pip install -e ".[web]"
+.venv\Scripts\filecompression-web.exe --host 0.0.0.0 --port 8000
+```
+
+Откройте `http://localhost:8000` на первом компьютере. Для второго устройства используйте URL из `GET /api/network-info`, например `http://192.168.1.15:8000`. Web UI создает локальные share links, отправляет FCMP через backend, скачивает контейнер и запускает реальную FCMP/SHA-256 проверку. Transfer-хранилище in-memory и истекает через 30 минут.
+
 Запуск сервера после установки пакета:
 
 ```text

@@ -15,15 +15,15 @@
 Нужен Python 3.12 или новее. Установка пакета из корня проекта:
 
 ```text
-python -m pip install -e .
-python -m pip install -e ".[dev]"
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
 ## CLI
 
 ```text
-python -m filecompression.cli compress input.bin output.fcmp --algorithm huffman
-python -m filecompression.cli decompress output.fcmp restored.bin
+.venv\Scripts\python.exe -m filecompression.cli compress input.bin output.fcmp --algorithm huffman
+.venv\Scripts\python.exe -m filecompression.cli decompress output.fcmp restored.bin
 ```
 
 CLI показывает размеры, коэффициент сжатия, экономию и время обработки. Размером передачи считается полный контейнер, включая заголовок и метаданные. Для случайных или уже сжатых данных размер может увеличиться.
@@ -35,14 +35,14 @@ CLI показывает размеры, коэффициент сжатия, э
 Запуск сервера после установки пакета:
 
 ```text
-filecompression-server --host 127.0.0.1 --port 8765
+.venv\Scripts\filecompression-server.exe --host 127.0.0.1 --port 8765
 ```
 
 Минимальный графический клиент запускается так:
 
 ```text
-python -m pip install -e ".[gui]"
-python -m filecompression.gui.app
+.venv\Scripts\python.exe -m pip install -e ".[gui]"
+.venv\Scripts\python.exe -m filecompression.gui.app
 ```
 
 Сетевой транспорт предназначен для учебной локальной демонстрации: аутентификация и шифрование пока не входят в область проекта.
@@ -50,8 +50,10 @@ python -m filecompression.gui.app
 ## Benchmark и тесты
 
 ```text
-python benchmarks/compression_benchmark.py data/sample.txt data/sample.bin
-python -m pytest
+.venv\Scripts\python.exe benchmarks/compression_benchmark.py data/sample.txt data/sample.bin
+.venv\Scripts\python.exe benchmarks/compression_benchmark.py --generate-fixtures benchmark-results/fixtures --output benchmark-results/benchmark_results.csv
+.venv\Scripts\python.exe benchmarks/generate_plots.py benchmark-results/benchmark_results.csv
+.venv\Scripts\python.exe -m pytest
 ```
 
 Benchmark формирует CSV с фактическими размерами, коэффициентами и временами для каждого алгоритма. Численные результаты не должны добавляться в документацию вручную.

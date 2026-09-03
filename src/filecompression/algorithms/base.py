@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024
+
 
 class CompressionAlgorithm(ABC):
     """Binary codec contract used by the container and application layers."""

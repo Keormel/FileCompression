@@ -34,7 +34,9 @@ class TransferClient:
         response = await receive_message(self.reader)
         if response.get("type") != "file":
             raise FileNotFoundError(response.get("message", "Inbox is empty"))
-        return await receive_frame(self.reader)
+        container = await receive_frame(self.reader)
+        await send_message(self.writer, {"type": "received"})
+        return container
 
     async def close(self) -> None:
         if self.writer is not None:

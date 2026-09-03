@@ -6,6 +6,7 @@ import struct
 from dataclasses import dataclass
 
 from filecompression.algorithms import get_algorithm
+from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
 from filecompression.errors import ContainerError, CorruptDataError
 
 MAGIC = b"FCMP"
@@ -15,6 +16,7 @@ _ALGORITHM_IDS = {"huffman": 1, "lzw": 2, "rle": 3}
 _ID_TO_ALGORITHM = {value: key for key, value in _ALGORITHM_IDS.items()}
 _MAX_NAME_BYTES = 1024
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -41,8 +43,12 @@ class Container:
 
 
 def pack(data: bytes, filename: str, algorithm: str) -> bytes:
+    if not isinstance(data, bytes) or len(data) > MAX_DECOMPRESSED_SIZE:
+        raise ContainerError("Input data exceeds the safety limit")
+    if not isinstance(filename, str) or not isinstance(algorithm, str):
+        raise ContainerError("Filename and algorithm must be strings")
     safe_name = os.path.basename(filename)
-    if not safe_name or safe_name in (".", "..") or safe_name != filename:
+    if not safe_name or safe_name in (".", "..") or safe_name != filename or any(ord(character) < 32 for character in safe_name):
         raise ContainerError("Filename must not contain directory components")
     name_bytes = safe_name.encode("utf-8")
     if len(name_bytes) > _MAX_NAME_BYTES:
@@ -53,7 +59,7 @@ def pack(data: bytes, filename: str, algorithm: str) -> bytes:
     except KeyError as error:
         raise ContainerError(f"Unknown algorithm: {algorithm}") from error
     payload, metadata = get_algorithm(algorithm_name).compress(data)
-    if len(metadata) > _MAX_METADATA_BYTES:
+    if len(metadata) > _MAX_METADATA_BYTES or len(payload) > _MAX_PAYLOAD_BYTES:
         raise ContainerError("Algorithm metadata is too large")
     header = _HEADER.pack(
         MAGIC,
@@ -79,7 +85,7 @@ def unpack(raw: bytes) -> Container:
     if magic != MAGIC or version != VERSION or flags != 0:
         raise ContainerError("Unsupported container format")
     algorithm = _ID_TO_ALGORITHM.get(algorithm_id)
-    if algorithm is None or name_length > _MAX_NAME_BYTES or metadata_length > _MAX_METADATA_BYTES:
+    if algorithm is None or original_size > MAX_DECOMPRESSED_SIZE or name_length > _MAX_NAME_BYTES or metadata_length > _MAX_METADATA_BYTES or payload_length > _MAX_PAYLOAD_BYTES:
         raise ContainerError("Invalid container metadata")
     end = _HEADER.size + name_length + metadata_length + payload_length
     if end != len(raw):

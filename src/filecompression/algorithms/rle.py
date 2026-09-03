@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 
 from filecompression.errors import CorruptDataError
-from .base import CompressionAlgorithm
+from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm
 
 
 class RleAlgorithm(CompressionAlgorithm):
@@ -30,5 +30,7 @@ class RleAlgorithm(CompressionAlgorithm):
             count = struct.unpack(">I", payload[index:index + 4])[0]
             if count == 0:
                 raise CorruptDataError("RLE run cannot be empty")
+            if len(output) + count > MAX_DECOMPRESSED_SIZE:
+                raise CorruptDataError("RLE output exceeds the safety limit")
             output.extend(bytes([payload[index + 4]]) * count)
         return bytes(output)

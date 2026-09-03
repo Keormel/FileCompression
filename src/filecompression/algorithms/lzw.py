@@ -4,7 +4,7 @@ import json
 import struct
 
 from filecompression.errors import CorruptDataError
-from .base import CompressionAlgorithm
+from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm
 
 
 class LzwAlgorithm(CompressionAlgorithm):
@@ -33,7 +33,8 @@ class LzwAlgorithm(CompressionAlgorithm):
 
     def decompress(self, payload: bytes, metadata: bytes) -> bytes:
         try:
-            if json.loads(metadata.decode("ascii"))["code_width"] != 16 or len(payload) % 2:
+            decoded_metadata = json.loads(metadata.decode("ascii"))
+            if set(decoded_metadata) != {"code_width"} or decoded_metadata["code_width"] != 16 or len(payload) % 2:
                 raise ValueError
         except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as error:
             raise CorruptDataError("Invalid LZW metadata or payload length") from error
@@ -53,6 +54,8 @@ class LzwAlgorithm(CompressionAlgorithm):
                 entry = previous + previous[:1]
             else:
                 raise CorruptDataError("Invalid LZW code")
+            if len(output) + len(entry) > MAX_DECOMPRESSED_SIZE:
+                raise CorruptDataError("LZW output exceeds the safety limit")
             output.extend(entry)
             if next_code <= self._maximum_code:
                 dictionary[next_code] = previous + entry[:1]

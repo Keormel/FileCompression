@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import json
+import struct
+
+from filecompression.errors import CorruptDataError
+from .base import CompressionAlgorithm
+
+
+class LzwAlgorithm(CompressionAlgorithm):
+    name = "lzw"
+    _maximum_code = 65535
+
+    def compress(self, data: bytes) -> tuple[bytes, bytes]:
+        if not data:
+            return b"", json.dumps({"code_width": 16}).encode("ascii")
+        dictionary = {bytes([value]): value for value in range(256)}
+        next_code = 256
+        phrase = bytes([data[0]])
+        codes: list[int] = []
+        for value in data[1:]:
+            candidate = phrase + bytes([value])
+            if candidate in dictionary:
+                phrase = candidate
+                continue
+            codes.append(dictionary[phrase])
+            if next_code <= self._maximum_code:
+                dictionary[candidate] = next_code
+                next_code += 1
+            phrase = bytes([value])
+        codes.append(dictionary[phrase])
+        return b"".join(struct.pack(">H", code) for code in codes), json.dumps({"code_width": 16}).encode("ascii")
+
+    def decompress(self, payload: bytes, metadata: bytes) -> bytes:
+        try:
+            if json.loads(metadata.decode("ascii"))["code_width"] != 16 or len(payload) % 2:
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise CorruptDataError("Invalid LZW metadata or payload length") from error
+        if not payload:
+            return b""
+        codes = [struct.unpack(">H", payload[index:index + 2])[0] for index in range(0, len(payload), 2)]
+        if codes[0] > 255:
+            raise CorruptDataError("Invalid first LZW code")
+        dictionary = {value: bytes([value]) for value in range(256)}
+        next_code = 256
+        previous = dictionary[codes[0]]
+        output = bytearray(previous)
+        for code in codes[1:]:
+            if code in dictionary:
+                entry = dictionary[code]
+            elif code == next_code:
+                entry = previous + previous[:1]
+            else:
+                raise CorruptDataError("Invalid LZW code")
+            output.extend(entry)
+            if next_code <= self._maximum_code:
+                dictionary[next_code] = previous + entry[:1]
+                next_code += 1
+            previous = entry
+        return bytes(output)

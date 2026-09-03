@@ -20,7 +20,7 @@ def generate_fixtures(directory: Path) -> list[Path]:
     (directory / "data.json").write_text(json.dumps({"items": [{"id": index, "value": "sample"} for index in range(1000)]}), encoding="utf-8")
     (directory / "data.csv").write_text("id,value\n" + "\n".join(f"{index},sample" for index in range(1000)), encoding="utf-8")
     (directory / "random.bin").write_bytes(bytes((index * 73 + 19) % 256 for index in range(100_000)))
-    return sorted(directory.glob("*"))
+    return sorted(path for path in directory.glob("*") if path.is_file())
 
 
 def run(paths: list[Path], output: Path) -> list[dict]:
@@ -46,7 +46,10 @@ def run(paths: list[Path], output: Path) -> list[dict]:
                 results.append(result)
                 writer.writerow(result.values())
     output.with_suffix(".json").write_text(json.dumps({"python": platform.python_version(), "platform": platform.platform(), "results": results}, indent=2), encoding="utf-8")
-    output.with_suffix(".md").write_text("# Benchmark results\n\n" + "\n".join("| " + " | ".join(str(value) for value in result.values()) + " |" for result in results), encoding="utf-8")
+    columns = list(results[0]) if results else []
+    table = ["# Benchmark results", "", "| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    table.extend("| " + " | ".join(str(result[column]) for column in columns) + " |" for result in results)
+    output.with_suffix(".md").write_text("\n".join(table) + "\n", encoding="utf-8")
     return results
 
 

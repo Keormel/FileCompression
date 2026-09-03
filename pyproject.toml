@@ -23,3 +23,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.coverage.run]
+source = ["filecompression"]
+omit = ["*/cli.py", "*/server_cli.py", "*/gui/*"]

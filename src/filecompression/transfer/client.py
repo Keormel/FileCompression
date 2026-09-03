@@ -14,11 +14,15 @@ class TransferClient:
         self.writer: asyncio.StreamWriter | None = None
 
     async def connect(self) -> None:
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-        await send_message(self.writer, {"type": "register", "user": self.user})
-        response = await receive_message(self.reader)
-        if response.get("type") != "registered":
-            raise ConnectionError(response.get("message", "Registration failed"))
+        try:
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            await send_message(self.writer, {"type": "register", "user": self.user})
+            response = await receive_message(self.reader)
+            if response.get("type") != "registered":
+                raise ConnectionError(response.get("message", "Registration failed"))
+        except Exception:
+            await self.close()
+            raise
 
     async def send(self, recipient: str, container: bytes) -> None:
         self._connected()
@@ -37,6 +41,14 @@ class TransferClient:
         container = await receive_frame(self.reader)
         await send_message(self.writer, {"type": "received"})
         return container
+
+    async def list_incoming(self) -> int:
+        self._connected()
+        await send_message(self.writer, {"type": "list"})
+        response = await receive_message(self.reader)
+        if response.get("type") != "incoming":
+            raise ConnectionError(response.get("message", "Unable to list inbox"))
+        return int(response["count"])
 
     async def close(self) -> None:
         if self.writer is not None:

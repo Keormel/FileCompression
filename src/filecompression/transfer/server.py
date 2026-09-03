@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from filecompression.container import unpack
+from filecompression.errors import CompressionError
 from .protocol import receive_frame, receive_message, send_frame, send_message
 
 MAX_INBOX_FILES = 32
@@ -42,6 +43,7 @@ class TransferServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         username: str | None = None
+        registered = False
         try:
             registration = await receive_message(reader)
             if registration.get("type") != "register" or not self._valid_user(registration.get("user")):
@@ -52,16 +54,22 @@ class TransferServer:
                 await send_message(writer, {"type": "error", "message": "User is already connected"})
                 return
             self._users.setdefault(username, _Inbox())
+            registered = True
             await send_message(writer, {"type": "registered", "user": username})
             while True:
                 request = await receive_message(reader)
                 if request.get("type") == "send":
                     recipient = request.get("recipient")
                     if not self._valid_user(recipient) or recipient not in self._users:
+                        await receive_frame(reader)
                         await send_message(writer, {"type": "error", "message": "Recipient is not connected"})
                         continue
                     container = await receive_frame(reader)
-                    unpack(container)
+                    try:
+                        unpack(container)
+                    except CompressionError as error:
+                        await send_message(writer, {"type": "error", "message": str(error)})
+                        continue
                     inbox = self._users[recipient]
                     if len(inbox.containers) >= MAX_INBOX_FILES or sum(len(item) for item in inbox.containers) + len(container) > MAX_INBOX_BYTES:
                         await send_message(writer, {"type": "error", "message": "Recipient inbox is full"})
@@ -82,10 +90,10 @@ class TransferServer:
                         self._users[username].containers.pop(0)
                 else:
                     await send_message(writer, {"type": "error", "message": "Unknown request"})
-        except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
+        except (asyncio.IncompleteReadError, ConnectionError, TimeoutError, CompressionError):
             pass
         finally:
-            if username is not None:
+            if registered and username is not None:
                 self._users.pop(username, None)
             writer.close()
             await writer.wait_closed()

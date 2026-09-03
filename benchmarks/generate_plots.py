@@ -29,6 +29,11 @@ def generate(csv_path: Path, output_dir: Path) -> None:
         for index, algorithm in enumerate(algorithms):
             values = [groups[label][algorithm][0] for label in labels]
             axis.bar([position + index * width for position in range(len(labels))], values, width, label=algorithm)
+            if secondary is not None:
+                secondary_groups: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+                for row in rows:
+                    secondary_groups[row["file"]][row["algorithm"]].append(float(row[secondary]))
+                axis.bar([position + index * width + width / 2 for position in range(len(labels))], [secondary_groups[label][algorithm][0] for label in labels], width, alpha=0.45, label=f"{algorithm} original")
         axis.set_title(title)
         axis.set_ylabel(ylabel)
         axis.set_xticks([position + width for position in range(len(labels))], labels, rotation=45, ha="right")

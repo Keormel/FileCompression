@@ -6,9 +6,9 @@
 .venv\Scripts\python.exe -m pytest -v
 ```
 
-Последний фактический прогон: **37 passed, 0 failed, 0 errors** на Python 3.14.3 в `.venv`. Тесты покрывают round-trip всех кодеков, пустые и бинарные данные, поврежденные Huffman/LZW/RLE потоки, FCMP header/truncation/trailing bytes/checksum/path traversal и TCP передачу между двумя пользователями.
+Последний фактический прогон: **40 passed, 0 failed, 0 errors** на Python 3.14.3 в `.venv`. Тесты покрывают round-trip всех кодеков, пустые и бинарные данные, поврежденные Huffman/LZW/RLE потоки, FCMP header/truncation/trailing bytes/checksum/path traversal и TCP передачу между двумя пользователями.
 
-Покрытие последнего запуска: **69%** (`589` statements, `181` missed). Непокрытые строки в основном относятся к интерактивным CLI/GUI entrypoints и негативным ветвям сетевого сервера.
+Покрытие backend последнего запуска: **83%** (`518` statements, `86` missed). Интерактивные CLI/GUI entrypoints исключены из метрики, так как проверяются smoke/import тестами.
 
 Фактические значения Passed/Failed/Errors должны обновляться после запуска pytest и не должны вписываться вручную. Для покрытия используется дополнительная зависимость `pytest-cov`:
 

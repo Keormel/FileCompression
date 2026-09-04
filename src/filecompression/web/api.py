@@ -8,6 +8,7 @@ import os
 import secrets
 import socket
 import threading
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -24,9 +25,9 @@ from filecompression.transfer import TransferClient
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import Response
+    from fastapi.responses import JSONResponse, Response, PlainTextResponse
 except ImportError:
-    FastAPI = File = Form = HTTPException = UploadFile = CORSMiddleware = Response = None
+    FastAPI = File = Form = HTTPException = UploadFile = CORSMiddleware = JSONResponse = Response = PlainTextResponse = None
 
 MAX_UPLOAD_SIZE = min(int(os.getenv("FILECOMP_MAX_UPLOAD_BYTES", str(MAX_DECOMPRESSED_SIZE))), MAX_DECOMPRESSED_SIZE)
 TRANSFER_TTL_SECONDS = 30 * 60
@@ -35,16 +36,26 @@ MAX_TRANSFER_BYTES = int(os.getenv("FILECOMP_MAX_TRANSFER_BYTES", str(1024 * 102
 MAX_CONCURRENT_UPLOADS = int(os.getenv("FILECOMP_MAX_CONCURRENT_UPLOADS", "2"))
 ENABLE_TRANSFER_SESSIONS = os.getenv("FILECOMP_ENABLE_SESSIONS", "false").lower() == "true"
 TRANSFER_SERVER_HOST = os.getenv("FILECOMP_TRANSFER_HOST", "")
+STORAGE_DIR = Path(os.getenv("FILECOMP_STORAGE_DIR", str(Path.cwd() / "data")))
+API_KEY = os.getenv("FILECOMP_API_KEY", "")
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("FILECOMP_RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_REQUESTS = int(os.getenv("FILECOMP_RATE_LIMIT_REQUESTS", "120"))
 logger = logging.getLogger("filecompression.web")
 upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+rate_limit: dict[str, tuple[int, float]] = {}
+metrics = {"uploads_started": 0, "uploads_completed": 0, "uploads_failed": 0, "uploads_cancelled": 0}
 
 
 @dataclass
 class Transfer:
     identifier: str
-    container: bytes
+    container_path: Path
     created_at: float
     downloaded: bool = False
+
+    @property
+    def container(self) -> bytes:
+        return self.container_path.read_bytes()
 
     @property
     def expired(self) -> bool:
@@ -78,6 +89,7 @@ def _purge_expired() -> None:
     now = time.time()
     for identifier, transfer in list(transfers.items()):
         if transfer.expired:
+            transfer.container_path.unlink(missing_ok=True)
             del transfers[identifier]
             logger.info("expired transfer id=%s", identifier)
     with operation_lock:
@@ -86,28 +98,52 @@ def _purge_expired() -> None:
                 operations.pop(identifier, None)
 
 
-async def _read_upload(file: UploadFile) -> bytes:
-    chunks: list[bytes] = []
+async def _read_upload(file: UploadFile) -> Path:
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix="upload-", suffix=".tmp", dir=STORAGE_DIR, delete=False)
+    path = Path(handle.name)
     total = 0
-    while True:
-        chunk = await file.read(min(1024 * 1024, MAX_UPLOAD_SIZE + 1 - total))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > MAX_UPLOAD_SIZE:
-            raise HTTPException(413, "File exceeds the configured upload limit")
-    return b"".join(chunks)
+    try:
+        with handle:
+            while True:
+                chunk = await file.read(min(1024 * 1024, MAX_UPLOAD_SIZE + 1 - total))
+                if not chunk:
+                    break
+                handle.write(chunk)
+                total += len(chunk)
+                if total > MAX_UPLOAD_SIZE:
+                    raise HTTPException(413, "File exceeds the configured upload limit")
+        return path
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _store_transfer(container: bytes) -> str:
     _purge_expired()
-    stored_bytes = sum(len(item.container) for item in transfers.values())
+    stored_bytes = sum(item.container_path.stat().st_size for item in transfers.values() if item.container_path.exists())
     if len(transfers) >= MAX_TRANSFERS or stored_bytes + len(container) > MAX_TRANSFER_BYTES:
         raise HTTPException(507, "Transfer storage limit reached")
     identifier = secrets.token_urlsafe(8)
-    transfers[identifier] = Transfer(identifier, container, time.time())
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STORAGE_DIR / f"{identifier}.fcmp"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(container)
+    temporary.replace(path)
+    transfers[identifier] = Transfer(identifier, path, time.time())
     return identifier
+
+
+def _load_persisted_transfers() -> None:
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in STORAGE_DIR.glob("*.fcmp"):
+        identifier = path.stem
+        try:
+            unpack(path.read_bytes())
+        except CompressionError:
+            path.unlink(missing_ok=True)
+            continue
+        transfers[identifier] = Transfer(identifier, path, path.stat().st_mtime)
 
 
 def _operation_metadata(operation: CompressionOperation) -> dict:
@@ -126,7 +162,7 @@ def _operation_metadata(operation: CompressionOperation) -> dict:
     }
 
 
-def _run_compression(operation: CompressionOperation, data: bytes) -> None:
+def _run_compression(operation: CompressionOperation, upload_path: Path) -> None:
     started = time.perf_counter()
 
     def progress(processed: int, total: int) -> None:
@@ -141,29 +177,40 @@ def _run_compression(operation: CompressionOperation, data: bytes) -> None:
     try:
         with operation_lock:
             operation.status = "processing"
+        data = upload_path.read_bytes()
         container = pack(data, operation.filename, operation.algorithm, progress)
         if operation.cancel_event.is_set():
             raise RuntimeError("Compression cancelled")
         _purge_expired()
         with operation_lock:
-            stored_bytes = sum(len(item.container) for item in transfers.values())
+            stored_bytes = sum(item.container_path.stat().st_size for item in transfers.values() if item.container_path.exists())
             if len(transfers) >= MAX_TRANSFERS or stored_bytes + len(container) > MAX_TRANSFER_BYTES:
                 raise RuntimeError("Transfer storage limit reached")
             identifier = secrets.token_urlsafe(8)
-            transfers[identifier] = Transfer(identifier, container, time.time())
+            STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            path = STORAGE_DIR / f"{identifier}.fcmp"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_bytes(container)
+            temporary.replace(path)
+            transfers[identifier] = Transfer(identifier, path, time.time())
             operation.transfer_id = identifier
             operation.processed_bytes = operation.total_bytes
             operation.eta = 0.0
             operation.status = "completed"
+            metrics["uploads_completed"] += 1
     except RuntimeError as error:
         with operation_lock:
             operation.status = "cancelled" if "cancelled" in str(error).lower() else "error"
             operation.error = str(error)
+        metrics["uploads_cancelled" if operation.status == "cancelled" else "uploads_failed"] += 1
     except Exception as error:
         with operation_lock:
             operation.status = "error"
             operation.error = str(error)
             logger.error("compression failed id=%s: %s", operation.identifier, error)
+        metrics["uploads_failed"] += 1
+    finally:
+        upload_path.unlink(missing_ok=True)
 
 
 def _network_ip() -> str:
@@ -197,7 +244,9 @@ def create_app():
 
     app = FastAPI(title="FileComp API", version="1.0")
     allowed_origins = [item.strip() for item in os.getenv("FILECOMP_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()]
-    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type"], max_age=600)
+    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type", "X-API-Key"], max_age=600)
+
+    _load_persisted_transfers()
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -207,11 +256,34 @@ def create_app():
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         return response
 
+    @app.middleware("http")
+    async def production_guards(request, call_next):
+        client = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        count, window = rate_limit.get(client, (0, now))
+        if now - window >= RATE_LIMIT_WINDOW_SECONDS:
+            count, window = 0, now
+        count += 1
+        rate_limit[client] = (count, window)
+        if count > RATE_LIMIT_REQUESTS:
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429, headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)})
+        if API_KEY and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+            if request.headers.get("x-api-key") != API_KEY:
+                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        return await call_next(request)
+
     frontend_index = Path(__file__).resolve().parents[3] / "frontend" / "dist" / "index.html"
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"status": "online"}
+        return {"status": "online", "active_operations": sum(operation.status in {"queued", "processing", "cancelling"} for operation in operations.values()), "stored_transfers": len(transfers)}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> PlainTextResponse:
+        lines = [f"filecompression_{key} {value}" for key, value in metrics.items()]
+        lines.append(f"filecompression_active_operations {sum(operation.status in {'queued', 'processing', 'cancelling'} for operation in operations.values())}")
+        lines.append(f"filecompression_stored_transfers {len(transfers)}")
+        return PlainTextResponse("\n".join(lines) + "\n")
 
     @app.get("/api/network-info")
     async def network_info() -> dict:
@@ -231,17 +303,18 @@ def create_app():
         except CompressionError as error:
             raise HTTPException(400, str(error)) from error
         async with upload_slots:
-            data = await _read_upload(file)
+            upload_path = await _read_upload(file)
         operation = CompressionOperation(
             uuid.uuid4().hex,
             filename,
-            len(data),
+            upload_path.stat().st_size,
             algorithm,
         )
         with operation_lock:
             operations[operation.identifier] = operation
-        logger.info("compression queued id=%s filename=%s size=%d algorithm=%s", operation.identifier, filename, len(data), algorithm)
-        compression_executor.submit(_run_compression, operation, data)
+        metrics["uploads_started"] += 1
+        logger.info("compression queued id=%s filename=%s size=%d algorithm=%s", operation.identifier, filename, operation.total_bytes, algorithm)
+        compression_executor.submit(_run_compression, operation, upload_path)
         return _operation_metadata(operation)
 
     @app.get("/api/compress/{identifier}/status")
@@ -270,11 +343,14 @@ def create_app():
         except CompressionError as error:
             raise HTTPException(400, str(error)) from error
         async with upload_slots:
-            data = await _read_upload(file)
+            upload_path = await _read_upload(file)
         try:
+            data = upload_path.read_bytes()
             container = await asyncio.to_thread(pack, data, filename, algorithm)
         except (CompressionError, ValueError) as error:
             raise HTTPException(400, str(error)) from error
+        finally:
+            upload_path.unlink(missing_ok=True)
         identifier = _store_transfer(container)
         return _metadata(identifier, transfers[identifier])
 
@@ -350,12 +426,15 @@ def create_app():
         except CompressionError as error:
             raise HTTPException(400, str(error)) from error
         async with upload_slots:
-            data = await _read_upload(file)
+            upload_path = await _read_upload(file)
         try:
+            data = upload_path.read_bytes()
             container = await asyncio.to_thread(pack, data, filename, "huffman")
             await client.send(recipient, container)
         except (CompressionError, OSError, ConnectionError, TimeoutError) as error:
             raise HTTPException(502, str(error)) from error
+        finally:
+            upload_path.unlink(missing_ok=True)
         return {"status": "sent", "compressed_size": len(container)}
 
     @app.post("/api/sessions/{identifier}/receive")

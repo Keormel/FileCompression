@@ -102,6 +102,8 @@ GUI поддерживает выбор файла и алгоритма, сжа
 
 Production-параметры задаются через переменные окружения; пример находится в `.env.example`. Не коммитьте `.env` и секреты. По умолчанию публичные TCP-сессии отключены (`FILECOMP_ENABLE_SESSIONS=false`), CORS ограничен локальными origins, uploads ограничены 256 MiB, а in-memory transfers ограничены количеством и общим размером.
 
+Для production задайте `FILECOMP_STORAGE_DIR` на persistent volume и `FILECOMP_API_KEY` на случайный секрет. При заданном API key все `/api/*`, кроме health, требуют заголовок `X-API-Key`. Встроенный rate limiter ограничивает запросы по IP; для нескольких реплик используйте rate limiting на reverse proxy или Redis.
+
 Сборка Docker:
 
 ```text
@@ -116,5 +118,7 @@ curl http://localhost:8000/api/health
 ```
 
 В production рекомендуется поставить TLS reverse proxy перед приложением, задать явный `FILECOMP_ALLOWED_ORIGINS`, ограничить сетевой доступ к порту и вынести transfer storage в persistent object storage. Текущий storage in-memory подходит для одной демонстрационной реплики: данные исчезают после рестарта.
+
+Upload теперь читается чанками во временный persistent storage, а готовые FCMP-контейнеры сохраняются на диске и восстанавливаются после рестарта. Однако текущие Huffman/LZW/RLE-кодеки всё ещё принимают `bytes` во время самой компрессии; для файлов больше safety limit нужен отдельный streaming codec/container refactor.
 
 CI выполняет Python tests/compile, frontend production build и Docker build через `.github/workflows/ci.yml`.

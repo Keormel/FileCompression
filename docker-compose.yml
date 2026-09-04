@@ -13,12 +13,21 @@ services:
       FILECOMP_MAX_UPLOAD_BYTES: ${FILECOMP_MAX_UPLOAD_BYTES:-268435456}
       FILECOMP_ENABLE_SESSIONS: ${FILECOMP_ENABLE_SESSIONS:-false}
       FILECOMP_TRANSFER_HOST: ${FILECOMP_TRANSFER_HOST:-}
+      FILECOMP_STORAGE_DIR: /var/lib/filecompression
+      FILECOMP_API_KEY: ${FILECOMP_API_KEY:-}
+      FILECOMP_RATE_LIMIT_WINDOW_SECONDS: ${FILECOMP_RATE_LIMIT_WINDOW_SECONDS:-60}
+      FILECOMP_RATE_LIMIT_REQUESTS: ${FILECOMP_RATE_LIMIT_REQUESTS:-120}
     ports:
       - "${FILECOMP_WEB_PORT:-8000}:8000"
     read_only: true
     tmpfs:
       - /tmp:size=512m,noexec,nosuid
+    volumes:
+      - filecompression-data:/var/lib/filecompression
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  filecompression-data:

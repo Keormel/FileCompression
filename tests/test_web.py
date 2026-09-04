@@ -1,13 +1,15 @@
 from fastapi.testclient import TestClient
 import time
 
-from filecompression.web.api import app, transfers
+import filecompression.web.api as web_api
+from filecompression.web.api import STORAGE_DIR, app, transfers
 
 
 def test_web_health_algorithms_and_network_info() -> None:
     client = TestClient(app)
     health = client.get("/api/health")
-    assert health.json() == {"status": "online"}
+    assert health.json()["status"] == "online"
+    assert health.json()["active_operations"] == 0
     assert health.headers["x-content-type-options"] == "nosniff"
     assert health.headers["x-frame-options"] == "DENY"
     assert [item["id"] for item in client.get("/api/algorithms").json()] == ["huffman", "lzw", "rle", "stored"]
@@ -21,6 +23,7 @@ def test_web_transfer_create_inspect_download_and_verify() -> None:
     assert response.status_code == 200
     transfer = response.json()
     identifier = transfer["id"]
+    assert (STORAGE_DIR / f"{identifier}.fcmp").exists()
     assert transfer["algorithm"] in {"lzw", "stored"}
     assert client.get(f"/api/transfers/{identifier}").json()["status"] == "ready"
     download = client.get(f"/api/transfers/{identifier}/download")
@@ -30,6 +33,23 @@ def test_web_transfer_create_inspect_download_and_verify() -> None:
     verified = client.post(f"/api/transfers/{identifier}/verify")
     assert verified.json()["verified"] is True
     assert verified.json()["size"] == 9
+
+
+def test_web_metrics_endpoint_reports_counters() -> None:
+    response = TestClient(app).get("/metrics")
+    assert response.status_code == 200
+    assert "filecompression_stored_transfers" in response.text
+
+
+def test_web_api_key_authentication_can_be_enabled() -> None:
+    previous = web_api.API_KEY
+    web_api.API_KEY = "test-secret"
+    try:
+        client = TestClient(app)
+        assert client.get("/api/algorithms").status_code == 401
+        assert client.get("/api/algorithms", headers={"X-API-Key": "test-secret"}).status_code == 200
+    finally:
+        web_api.API_KEY = previous
 
 
 def test_web_rejects_invalid_algorithm_and_expired_transfer() -> None:

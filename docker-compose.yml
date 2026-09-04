@@ -1,0 +1,24 @@
+services:
+  filecompression:
+    build: .
+    restart: unless-stopped
+    environment:
+      FILECOMP_WEB_HOST: ${FILECOMP_WEB_HOST:-0.0.0.0}
+      FILECOMP_WEB_PORT: ${FILECOMP_WEB_PORT:-8000}
+      FILECOMP_LOG_LEVEL: ${FILECOMP_LOG_LEVEL:-INFO}
+      FILECOMP_ALLOWED_ORIGINS: ${FILECOMP_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      FILECOMP_MAX_TRANSFERS: ${FILECOMP_MAX_TRANSFERS:-32}
+      FILECOMP_MAX_TRANSFER_BYTES: ${FILECOMP_MAX_TRANSFER_BYTES:-1073741824}
+      FILECOMP_MAX_CONCURRENT_UPLOADS: ${FILECOMP_MAX_CONCURRENT_UPLOADS:-2}
+      FILECOMP_MAX_UPLOAD_BYTES: ${FILECOMP_MAX_UPLOAD_BYTES:-268435456}
+      FILECOMP_ENABLE_SESSIONS: ${FILECOMP_ENABLE_SESSIONS:-false}
+      FILECOMP_TRANSFER_HOST: ${FILECOMP_TRANSFER_HOST:-}
+    ports:
+      - "${FILECOMP_WEB_PORT:-8000}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

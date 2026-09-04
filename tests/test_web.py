@@ -6,7 +6,10 @@ from filecompression.web.api import app, transfers
 
 def test_web_health_algorithms_and_network_info() -> None:
     client = TestClient(app)
-    assert client.get("/api/health").json() == {"status": "online"}
+    health = client.get("/api/health")
+    assert health.json() == {"status": "online"}
+    assert health.headers["x-content-type-options"] == "nosniff"
+    assert health.headers["x-frame-options"] == "DENY"
     assert [item["id"] for item in client.get("/api/algorithms").json()] == ["huffman", "lzw", "rle", "stored"]
     assert client.get("/api/network-info").json()["url"].startswith("http://")
 
@@ -34,6 +37,14 @@ def test_web_rejects_invalid_algorithm_and_expired_transfer() -> None:
     response = client.post("/api/transfers", files={"file": ("sample.txt", b"data"), "algorithm": (None, "unknown")})
     assert response.status_code == 400
     assert client.get("/api/transfers/missing").status_code == 404
+
+
+def test_web_rejects_unsafe_upload_filename_and_sessions_by_default() -> None:
+    client = TestClient(app)
+    response = client.post("/api/transfers", files={"file": ("../secret.txt", b"data"), "algorithm": (None, "rle")})
+    assert response.status_code == 400
+    session = client.post("/api/sessions", data={"host": "127.0.0.1", "port": "8765", "user": "user_a"})
+    assert session.status_code == 404
 
 
 def test_web_compression_operation_reports_completion() -> None:

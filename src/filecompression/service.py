@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +27,14 @@ class CompressionStats:
 
 
 def compress_file(source: Path, destination: Path, algorithm: str) -> CompressionStats:
+    from .algorithms.base import MAX_DECOMPRESSED_SIZE
+    if source.stat().st_size > MAX_DECOMPRESSED_SIZE:
+        raise ValueError("Input file exceeds the 256 MiB safety limit")
     data = source.read_bytes()
     started = time.perf_counter()
     container = pack(data, source.name, algorithm)
     compression_time = time.perf_counter() - started
-    destination.write_bytes(container)
+    _atomic_write(destination, container)
     started = time.perf_counter()
     unpack(container).decompress()
     decompression_time = time.perf_counter() - started
@@ -37,7 +42,22 @@ def compress_file(source: Path, destination: Path, algorithm: str) -> Compressio
 
 
 def decompress_file(source: Path, destination: Path) -> None:
-    destination.write_bytes(unpack(source.read_bytes()).decompress())
+    _atomic_write(destination, unpack(source.read_bytes()).decompress())
+
+
+def _atomic_write(destination: Path, data: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix=f".{destination.name}.", dir=destination.parent, delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def checksum(path: Path) -> str:

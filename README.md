@@ -45,7 +45,7 @@ cd ..
 .venv\Scripts\filecompression-web.exe --host 0.0.0.0 --port 8000
 ```
 
-Откройте `http://localhost:8000` на первом компьютере. Для второго устройства используйте URL из `GET /api/network-info`, например `http://192.168.1.15:8000`. Web UI создает локальные share links, отправляет FCMP через backend, скачивает контейнер и запускает реальную FCMP/SHA-256 проверку. Transfer-хранилище in-memory и истекает через 30 минут.
+Откройте `http://localhost:8000` на первом компьютере. Для второго устройства используйте URL из `GET /api/network-info`, например `http://192.168.1.15:8000`. Web UI создаёт share links, выполняет асинхронное сжатие с реальным progress и скачивает восстановленный исходный файл после FCMP/SHA-256 проверки. Transfer-хранилище in-memory и истекает через 30 минут.
 
 Запуск сервера после установки пакета:
 
@@ -97,3 +97,24 @@ benchmarks/       воспроизводимые измерения
 GUI поддерживает выбор файла и алгоритма, сжатие, статистику, подключение, отправку, получение, распаковку и проверку SHA-256. Операции выполняются в отдельном worker-thread; progress bar использует indeterminate-состояние для операций, где точный прогресс не передается backend. Для PNG, JPEG и PDF benchmark использует воспроизводимые fixtures из `tests/fixtures`; репозиторий не содержит copyrighted material.
 
 Материалы защиты находятся в `docs/coursework/`: сценарий демонстрации, вопросы преподавателя и итоговый отчет. Исходники Mermaid-диаграмм находятся в `docs/diagrams/`.
+
+## Production deployment
+
+Production-параметры задаются через переменные окружения; пример находится в `.env.example`. Не коммитьте `.env` и секреты. По умолчанию публичные TCP-сессии отключены (`FILECOMP_ENABLE_SESSIONS=false`), CORS ограничен локальными origins, uploads ограничены 256 MiB, а in-memory transfers ограничены количеством и общим размером.
+
+Сборка Docker:
+
+```text
+copy .env.example .env
+docker compose up --build -d
+```
+
+Проверка:
+
+```text
+curl http://localhost:8000/api/health
+```
+
+В production рекомендуется поставить TLS reverse proxy перед приложением, задать явный `FILECOMP_ALLOWED_ORIGINS`, ограничить сетевой доступ к порту и вынести transfer storage в persistent object storage. Текущий storage in-memory подходит для одной демонстрационной реплики: данные исчезают после рестарта.
+
+CI выполняет Python tests/compile, frontend production build и Docker build через `.github/workflows/ci.yml`.

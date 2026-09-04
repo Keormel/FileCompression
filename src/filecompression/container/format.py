@@ -19,6 +19,17 @@ _MAX_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 
+def validate_filename(filename: str) -> str:
+    if not isinstance(filename, str):
+        raise ContainerError("Filename must be a string")
+    safe_name = os.path.basename(filename)
+    if "/" in filename or "\\" in filename or not safe_name or safe_name in (".", "..") or safe_name != filename or any(ord(character) < 32 or ord(character) == 127 for character in safe_name):
+        raise ContainerError("Filename must not contain directory components or control characters")
+    if len(safe_name.encode("utf-8")) > _MAX_NAME_BYTES:
+        raise ContainerError("Filename is too long")
+    return safe_name
+
+
 @dataclass(frozen=True)
 class Container:
     filename: str
@@ -47,9 +58,7 @@ def pack(data: bytes, filename: str, algorithm: str, progress: ProgressCallback 
         raise ContainerError("Input data exceeds the safety limit")
     if not isinstance(filename, str) or not isinstance(algorithm, str):
         raise ContainerError("Filename and algorithm must be strings")
-    safe_name = os.path.basename(filename)
-    if not safe_name or safe_name in (".", "..") or safe_name != filename or any(ord(character) < 32 for character in safe_name):
-        raise ContainerError("Filename must not contain directory components")
+    safe_name = validate_filename(filename)
     name_bytes = safe_name.encode("utf-8")
     if len(name_bytes) > _MAX_NAME_BYTES:
         raise ContainerError("Filename is too long")
@@ -104,6 +113,5 @@ def unpack(raw: bytes) -> Container:
         filename = raw[name_start:metadata_start].decode("utf-8")
     except UnicodeDecodeError as error:
         raise ContainerError("Filename is not valid UTF-8") from error
-    if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
-        raise ContainerError("Unsafe filename in container")
+    validate_filename(filename)
     return Container(filename, algorithm, original_size, checksum.hex(), raw[metadata_start:payload_start], raw[payload_start:])

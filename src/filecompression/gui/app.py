@@ -10,7 +10,7 @@ from filecompression.transfer import TransferClient
 
 try:
     from PySide6.QtCore import QObject, QThread, Signal
-    from PySide6.QtWidgets import QApplication, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QComboBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget
+    from PySide6.QtWidgets import QApplication, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QComboBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget, QMessageBox
 except ImportError:
     QObject = QThread = Signal = None
 
@@ -63,6 +63,9 @@ if QObject is not None:
             self.connected.emit(user)
 
         async def _compress(self, source: Path, algorithm: str) -> None:
+            from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
+            if source.stat().st_size > MAX_DECOMPRESSED_SIZE:
+                raise ValueError("File exceeds the 256 MiB safety limit")
             data = source.read_bytes()
             started = asyncio.get_running_loop().time()
             self.container = pack(data, source.name, algorithm)

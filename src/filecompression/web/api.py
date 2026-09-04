@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import logging
 import os
 import secrets
 import socket
@@ -16,6 +17,7 @@ from pathlib import Path
 from filecompression.algorithms import algorithms
 from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
 from filecompression.container import pack, unpack
+from filecompression.container.format import validate_filename
 from filecompression.errors import CompressionError
 from filecompression.transfer import TransferClient
 
@@ -26,8 +28,15 @@ try:
 except ImportError:
     FastAPI = File = Form = HTTPException = UploadFile = CORSMiddleware = Response = None
 
-MAX_UPLOAD_SIZE = MAX_DECOMPRESSED_SIZE
+MAX_UPLOAD_SIZE = min(int(os.getenv("FILECOMP_MAX_UPLOAD_BYTES", str(MAX_DECOMPRESSED_SIZE))), MAX_DECOMPRESSED_SIZE)
 TRANSFER_TTL_SECONDS = 30 * 60
+MAX_TRANSFERS = int(os.getenv("FILECOMP_MAX_TRANSFERS", "32"))
+MAX_TRANSFER_BYTES = int(os.getenv("FILECOMP_MAX_TRANSFER_BYTES", str(1024 * 1024 * 1024)))
+MAX_CONCURRENT_UPLOADS = int(os.getenv("FILECOMP_MAX_CONCURRENT_UPLOADS", "2"))
+ENABLE_TRANSFER_SESSIONS = os.getenv("FILECOMP_ENABLE_SESSIONS", "false").lower() == "true"
+TRANSFER_SERVER_HOST = os.getenv("FILECOMP_TRANSFER_HOST", "")
+logger = logging.getLogger("filecompression.web")
+upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
 
 @dataclass
@@ -66,9 +75,39 @@ compression_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fil
 
 
 def _purge_expired() -> None:
+    now = time.time()
     for identifier, transfer in list(transfers.items()):
         if transfer.expired:
             del transfers[identifier]
+            logger.info("expired transfer id=%s", identifier)
+    with operation_lock:
+        for identifier, operation in list(operations.items()):
+            if now - operation.created_at > TRANSFER_TTL_SECONDS:
+                operations.pop(identifier, None)
+
+
+async def _read_upload(file: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(min(1024 * 1024, MAX_UPLOAD_SIZE + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_UPLOAD_SIZE:
+            raise HTTPException(413, "File exceeds the configured upload limit")
+    return b"".join(chunks)
+
+
+def _store_transfer(container: bytes) -> str:
+    _purge_expired()
+    stored_bytes = sum(len(item.container) for item in transfers.values())
+    if len(transfers) >= MAX_TRANSFERS or stored_bytes + len(container) > MAX_TRANSFER_BYTES:
+        raise HTTPException(507, "Transfer storage limit reached")
+    identifier = secrets.token_urlsafe(8)
+    transfers[identifier] = Transfer(identifier, container, time.time())
+    return identifier
 
 
 def _operation_metadata(operation: CompressionOperation) -> dict:
@@ -105,8 +144,12 @@ def _run_compression(operation: CompressionOperation, data: bytes) -> None:
         container = pack(data, operation.filename, operation.algorithm, progress)
         if operation.cancel_event.is_set():
             raise RuntimeError("Compression cancelled")
-        identifier = secrets.token_urlsafe(8)
+        _purge_expired()
         with operation_lock:
+            stored_bytes = sum(len(item.container) for item in transfers.values())
+            if len(transfers) >= MAX_TRANSFERS or stored_bytes + len(container) > MAX_TRANSFER_BYTES:
+                raise RuntimeError("Transfer storage limit reached")
+            identifier = secrets.token_urlsafe(8)
             transfers[identifier] = Transfer(identifier, container, time.time())
             operation.transfer_id = identifier
             operation.processed_bytes = operation.total_bytes
@@ -120,6 +163,7 @@ def _run_compression(operation: CompressionOperation, data: bytes) -> None:
         with operation_lock:
             operation.status = "error"
             operation.error = str(error)
+            logger.error("compression failed id=%s: %s", operation.identifier, error)
 
 
 def _network_ip() -> str:
@@ -152,7 +196,16 @@ def create_app():
         raise RuntimeError("Install web dependencies with: pip install -e '.[web]'")
 
     app = FastAPI(title="FileComp API", version="1.0")
-    app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+    allowed_origins = [item.strip() for item in os.getenv("FILECOMP_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()]
+    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type"], max_age=600)
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     frontend_index = Path(__file__).resolve().parents[3] / "frontend" / "dist" / "index.html"
 
@@ -173,17 +226,21 @@ def create_app():
 
     @app.post("/api/compress")
     async def start_compression(file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
-        data = await file.read(MAX_UPLOAD_SIZE + 1)
-        if len(data) > MAX_UPLOAD_SIZE:
-            raise HTTPException(413, "File exceeds the 256 MiB limit")
+        try:
+            filename = validate_filename(file.filename or "upload.bin")
+        except CompressionError as error:
+            raise HTTPException(400, str(error)) from error
+        async with upload_slots:
+            data = await _read_upload(file)
         operation = CompressionOperation(
             uuid.uuid4().hex,
-            Path(file.filename or "upload.bin").name,
+            filename,
             len(data),
             algorithm,
         )
         with operation_lock:
             operations[operation.identifier] = operation
+        logger.info("compression queued id=%s filename=%s size=%d algorithm=%s", operation.identifier, filename, len(data), algorithm)
         compression_executor.submit(_run_compression, operation, data)
         return _operation_metadata(operation)
 
@@ -208,16 +265,17 @@ def create_app():
 
     @app.post("/api/transfers")
     async def create_transfer(file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
-        data = await file.read(MAX_UPLOAD_SIZE + 1)
-        if len(data) > MAX_UPLOAD_SIZE:
-            raise HTTPException(413, "File exceeds the 256 MiB limit")
         try:
-            container = await asyncio.to_thread(pack, data, Path(file.filename or "upload.bin").name, algorithm)
+            filename = validate_filename(file.filename or "upload.bin")
+        except CompressionError as error:
+            raise HTTPException(400, str(error)) from error
+        async with upload_slots:
+            data = await _read_upload(file)
+        try:
+            container = await asyncio.to_thread(pack, data, filename, algorithm)
         except (CompressionError, ValueError) as error:
             raise HTTPException(400, str(error)) from error
-        _purge_expired()
-        identifier = secrets.token_urlsafe(8)
-        transfers[identifier] = Transfer(identifier, container, time.time())
+        identifier = _store_transfer(container)
         return _metadata(identifier, transfers[identifier])
 
     @app.get("/api/transfers/{identifier}")
@@ -256,6 +314,10 @@ def create_app():
 
     @app.post("/api/sessions")
     async def create_session(host: str = Form(...), port: int = Form(...), user: str = Form(...)) -> dict:
+        if not ENABLE_TRANSFER_SESSIONS:
+            raise HTTPException(404, "Transfer sessions are disabled")
+        if not TRANSFER_SERVER_HOST or host != TRANSFER_SERVER_HOST:
+            raise HTTPException(403, "Transfer host is not allowed")
         if not user.isidentifier() or not 1 <= len(user) <= 64 or not 1 <= port <= 65535:
             raise HTTPException(400, "Invalid user or port")
         client = TransferClient(host, port, user)
@@ -269,6 +331,8 @@ def create_app():
 
     @app.delete("/api/sessions/{identifier}")
     async def close_session(identifier: str) -> dict:
+        if not ENABLE_TRANSFER_SESSIONS:
+            raise HTTPException(404, "Transfer sessions are disabled")
         client = sessions.pop(identifier, None)
         if client:
             await client.close()
@@ -276,14 +340,19 @@ def create_app():
 
     @app.post("/api/sessions/{identifier}/send")
     async def send_session(identifier: str, recipient: str = Form(...), file: UploadFile = File(...)) -> dict:
+        if not ENABLE_TRANSFER_SESSIONS:
+            raise HTTPException(404, "Transfer sessions are disabled")
         client = sessions.get(identifier)
         if client is None:
             raise HTTPException(404, "Session not found")
-        data = await file.read(MAX_UPLOAD_SIZE + 1)
-        if len(data) > MAX_UPLOAD_SIZE:
-            raise HTTPException(413, "File exceeds the 256 MiB limit")
         try:
-            container = await asyncio.to_thread(pack, data, Path(file.filename or "upload.bin").name, "huffman")
+            filename = validate_filename(file.filename or "upload.bin")
+        except CompressionError as error:
+            raise HTTPException(400, str(error)) from error
+        async with upload_slots:
+            data = await _read_upload(file)
+        try:
+            container = await asyncio.to_thread(pack, data, filename, "huffman")
             await client.send(recipient, container)
         except (CompressionError, OSError, ConnectionError, TimeoutError) as error:
             raise HTTPException(502, str(error)) from error
@@ -291,6 +360,8 @@ def create_app():
 
     @app.post("/api/sessions/{identifier}/receive")
     async def receive_session(identifier: str) -> Response:
+        if not ENABLE_TRANSFER_SESSIONS:
+            raise HTTPException(404, "Transfer sessions are disabled")
         client = sessions.get(identifier)
         if client is None:
             raise HTTPException(404, "Session not found")

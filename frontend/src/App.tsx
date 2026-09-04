@@ -124,7 +124,7 @@ export default function App() {
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${transfer?.filename ?? "file"}.fcmp`;
+      link.download = transfer?.filename ?? "file";
       link.click();
       URL.revokeObjectURL(url);
       const result = await api.verify(id);

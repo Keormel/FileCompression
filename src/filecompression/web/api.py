@@ -236,10 +236,11 @@ def create_app():
             raise HTTPException(404, "Transfer not found or expired")
         try:
             container = unpack(transfer.container)
+            restored = await asyncio.to_thread(container.decompress)
         except CompressionError as error:
             raise HTTPException(422, str(error)) from error
         transfer.downloaded = True
-        return Response(transfer.container, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{container.filename}.fcmp"', "X-Checksum": container.checksum})
+        return Response(restored, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{container.filename}"', "X-Checksum": container.checksum})
 
     @app.post("/api/transfers/{identifier}/verify")
     async def verify(identifier: str) -> dict:

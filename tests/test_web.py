@@ -22,7 +22,8 @@ def test_web_transfer_create_inspect_download_and_verify() -> None:
     assert client.get(f"/api/transfers/{identifier}").json()["status"] == "ready"
     download = client.get(f"/api/transfers/{identifier}/download")
     assert download.status_code == 200
-    assert download.content.startswith(b"FCMP")
+    assert download.content == b"abcabcabc"
+    assert 'filename="sample.txt"' in download.headers["content-disposition"]
     verified = client.post(f"/api/transfers/{identifier}/verify")
     assert verified.json()["verified"] is True
     assert verified.json()["size"] == 9

@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024
+ProgressCallback = Callable[[int, int], None]
 
 
 class CompressionAlgorithm(ABC):
@@ -9,7 +11,7 @@ class CompressionAlgorithm(ABC):
     name: str
 
     @abstractmethod
-    def compress(self, data: bytes) -> tuple[bytes, bytes]:
+    def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         """Return compressed payload and decoder metadata."""
 
     @abstractmethod

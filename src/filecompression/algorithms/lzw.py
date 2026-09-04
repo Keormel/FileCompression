@@ -4,21 +4,21 @@ import json
 import struct
 
 from filecompression.errors import CorruptDataError
-from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm
+from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 
 class LzwAlgorithm(CompressionAlgorithm):
     name = "lzw"
     _maximum_code = 65535
 
-    def compress(self, data: bytes) -> tuple[bytes, bytes]:
+    def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         if not data:
             return b"", json.dumps({"code_width": 16}).encode("ascii")
         dictionary = {bytes([value]): value for value in range(256)}
         next_code = 256
         phrase = bytes([data[0]])
         codes: list[int] = []
-        for value in data[1:]:
+        for index, value in enumerate(data[1:], 2):
             candidate = phrase + bytes([value])
             if candidate in dictionary:
                 phrase = candidate
@@ -28,6 +28,8 @@ class LzwAlgorithm(CompressionAlgorithm):
                 dictionary[candidate] = next_code
                 next_code += 1
             phrase = bytes([value])
+            if progress is not None and (index == len(data) or index % (1024 * 1024) == 0):
+                progress(index, len(data))
         codes.append(dictionary[phrase])
         return b"".join(struct.pack(">H", code) for code in codes), json.dumps({"code_width": 16}).encode("ascii")
 

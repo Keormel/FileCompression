@@ -1,4 +1,4 @@
-import type { Algorithm, AlgorithmInfo, Transfer } from './types'
+import type { Algorithm, AlgorithmInfo, CompressionOperation, Transfer } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 
@@ -20,6 +20,14 @@ export const api = {
     form.append('algorithm', algorithm)
     return request<Transfer>('/api/transfers', { method: 'POST', body: form })
   },
+  startCompression: (file: File, algorithm: Algorithm) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('algorithm', algorithm)
+    return request<CompressionOperation>('/api/compress', { method: 'POST', body: form })
+  },
+  compressionStatus: (id: string) => request<CompressionOperation>(`/api/compress/${id}/status`),
+  cancelCompression: (id: string) => request<CompressionOperation>(`/api/compress/${id}/cancel`, { method: 'POST' }),
   transfer: (id: string) => request<Transfer>(`/api/transfers/${id}`),
   verify: (id: string) => request<{ verified: boolean; checksum: string; size: number }>(`/api/transfers/${id}/verify`, { method: 'POST' }),
   download: (id: string) => fetch(`${API}/api/transfers/${id}/download`),

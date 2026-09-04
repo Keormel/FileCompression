@@ -3,13 +3,13 @@ from __future__ import annotations
 import struct
 
 from filecompression.errors import CorruptDataError
-from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm
+from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 
 class RleAlgorithm(CompressionAlgorithm):
     name = "rle"
 
-    def compress(self, data: bytes) -> tuple[bytes, bytes]:
+    def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         output = bytearray()
         index = 0
         while index < len(data):
@@ -20,6 +20,8 @@ class RleAlgorithm(CompressionAlgorithm):
             output.extend(struct.pack(">I", end - index))
             output.append(value)
             index = end
+            if progress is not None and (index == len(data) or index % (1024 * 1024) == 0):
+                progress(index, len(data))
         return bytes(output), b""
 
     def decompress(self, payload: bytes, metadata: bytes) -> bytes:

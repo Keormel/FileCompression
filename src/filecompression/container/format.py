@@ -6,13 +6,13 @@ import struct
 from dataclasses import dataclass
 
 from filecompression.algorithms import get_algorithm
-from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
+from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE, ProgressCallback
 from filecompression.errors import ContainerError, CorruptDataError
 
 MAGIC = b"FCMP"
 VERSION = 1
 _HEADER = struct.Struct(">4sBBHQH32sIQ")
-_ALGORITHM_IDS = {"huffman": 1, "lzw": 2, "rle": 3}
+_ALGORITHM_IDS = {"huffman": 1, "lzw": 2, "rle": 3, "stored": 4}
 _ID_TO_ALGORITHM = {value: key for key, value in _ALGORITHM_IDS.items()}
 _MAX_NAME_BYTES = 1024
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
@@ -42,7 +42,7 @@ class Container:
         return restored
 
 
-def pack(data: bytes, filename: str, algorithm: str) -> bytes:
+def pack(data: bytes, filename: str, algorithm: str, progress: ProgressCallback | None = None) -> bytes:
     if not isinstance(data, bytes) or len(data) > MAX_DECOMPRESSED_SIZE:
         raise ContainerError("Input data exceeds the safety limit")
     if not isinstance(filename, str) or not isinstance(algorithm, str):
@@ -58,13 +58,20 @@ def pack(data: bytes, filename: str, algorithm: str) -> bytes:
         algorithm_id = _ALGORITHM_IDS[algorithm_name]
     except KeyError as error:
         raise ContainerError(f"Unknown algorithm: {algorithm}") from error
-    payload, metadata = get_algorithm(algorithm_name).compress(data)
+    payload, metadata = get_algorithm(algorithm_name).compress(data, progress)
     if len(metadata) > _MAX_METADATA_BYTES or len(payload) > _MAX_PAYLOAD_BYTES:
         raise ContainerError("Algorithm metadata is too large")
+    compressed = _make_container(data, safe_name, algorithm_name, payload, metadata)
+    stored = _make_container(data, safe_name, "stored", data, b"")
+    return compressed if len(compressed) < len(stored) else stored
+
+
+def _make_container(data: bytes, filename: str, algorithm: str, payload: bytes, metadata: bytes) -> bytes:
+    name_bytes = filename.encode("utf-8")
     header = _HEADER.pack(
         MAGIC,
         VERSION,
-        algorithm_id,
+        _ALGORITHM_IDS[algorithm],
         0,
         len(data),
         len(name_bytes),

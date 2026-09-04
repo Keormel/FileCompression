@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 
 from filecompression.errors import CorruptDataError
-from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm
+from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 
 @dataclass
@@ -19,10 +19,12 @@ class _Node:
 class HuffmanAlgorithm(CompressionAlgorithm):
     name = "huffman"
 
-    def compress(self, data: bytes) -> tuple[bytes, bytes]:
+    def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         frequencies = [0] * 256
-        for value in data:
+        for index, value in enumerate(data, 1):
             frequencies[value] += 1
+            if progress is not None and (index == len(data) or index % (1024 * 1024) == 0):
+                progress(index, len(data))
         if not data:
             return b"", json.dumps({"frequencies": {}, "bit_count": 0}, separators=(",", ":")).encode("ascii")
 

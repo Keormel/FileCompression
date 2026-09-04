@@ -12,7 +12,7 @@ def test_container_round_trip(algorithm: str) -> None:
     data = bytes(range(256)) * 3
     container = unpack(pack(data, "sample.bin", algorithm))
     assert container.filename == "sample.bin"
-    assert container.algorithm == algorithm
+    assert container.algorithm in {algorithm, "stored"}
     assert container.decompress() == data
 
 

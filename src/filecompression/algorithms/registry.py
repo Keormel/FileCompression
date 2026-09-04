@@ -6,11 +6,13 @@ def algorithms() -> dict[str, CompressionAlgorithm]:
     from .huffman import HuffmanAlgorithm
     from .lzw import LzwAlgorithm
     from .rle import RleAlgorithm
+    from .stored import StoredAlgorithm
 
     return {
         "huffman": HuffmanAlgorithm(),
         "lzw": LzwAlgorithm(),
         "rle": RleAlgorithm(),
+        "stored": StoredAlgorithm(),
     }
 
 

@@ -6,8 +6,11 @@ import ipaddress
 import os
 import secrets
 import socket
+import threading
 import time
-from dataclasses import dataclass
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from filecompression.algorithms import algorithms
@@ -39,14 +42,84 @@ class Transfer:
         return time.time() - self.created_at > TRANSFER_TTL_SECONDS
 
 
+@dataclass
+class CompressionOperation:
+    identifier: str
+    filename: str
+    total_bytes: int
+    algorithm: str
+    processed_bytes: int = 0
+    speed: float = 0.0
+    eta: float | None = None
+    status: str = "queued"
+    error: str | None = None
+    transfer_id: str | None = None
+    created_at: float = field(default_factory=time.time)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
 transfers: dict[str, Transfer] = {}
 sessions: dict[str, TransferClient] = {}
+operations: dict[str, CompressionOperation] = {}
+operation_lock = threading.Lock()
+compression_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="filecompression")
 
 
 def _purge_expired() -> None:
     for identifier, transfer in list(transfers.items()):
         if transfer.expired:
             del transfers[identifier]
+
+
+def _operation_metadata(operation: CompressionOperation) -> dict:
+    return {
+        "operationId": operation.identifier,
+        "filename": operation.filename,
+        "algorithm": operation.algorithm,
+        "progress": round(operation.processed_bytes / operation.total_bytes * 100, 2) if operation.total_bytes else 100,
+        "processedBytes": operation.processed_bytes,
+        "totalBytes": operation.total_bytes,
+        "speed": operation.speed,
+        "eta": operation.eta,
+        "status": operation.status,
+        "error": operation.error,
+        "transferId": operation.transfer_id,
+    }
+
+
+def _run_compression(operation: CompressionOperation, data: bytes) -> None:
+    started = time.perf_counter()
+
+    def progress(processed: int, total: int) -> None:
+        if operation.cancel_event.is_set():
+            raise RuntimeError("Compression cancelled")
+        elapsed = time.perf_counter() - started
+        with operation_lock:
+            operation.processed_bytes = processed
+            operation.speed = processed / elapsed if elapsed > 0 else 0.0
+            operation.eta = (total - processed) / operation.speed if operation.speed > 0 else None
+
+    try:
+        with operation_lock:
+            operation.status = "processing"
+        container = pack(data, operation.filename, operation.algorithm, progress)
+        if operation.cancel_event.is_set():
+            raise RuntimeError("Compression cancelled")
+        identifier = secrets.token_urlsafe(8)
+        with operation_lock:
+            transfers[identifier] = Transfer(identifier, container, time.time())
+            operation.transfer_id = identifier
+            operation.processed_bytes = operation.total_bytes
+            operation.eta = 0.0
+            operation.status = "completed"
+    except RuntimeError as error:
+        with operation_lock:
+            operation.status = "cancelled" if "cancelled" in str(error).lower() else "error"
+            operation.error = str(error)
+    except Exception as error:
+        with operation_lock:
+            operation.status = "error"
+            operation.error = str(error)
 
 
 def _network_ip() -> str:
@@ -95,20 +168,43 @@ def create_app():
 
     @app.get("/api/algorithms")
     async def list_algorithms() -> list[dict]:
-        descriptions = {"huffman": "Frequency-based lossless compression.", "lzw": "Dictionary-based lossless compression.", "rle": "Run-length encoding for repetitive data."}
+        descriptions = {"huffman": "Frequency-based lossless compression.", "lzw": "Dictionary-based lossless compression.", "rle": "Run-length encoding for repetitive data.", "stored": "Original bytes when compression would increase size."}
         return [{"id": name, "label": name.upper(), "description": descriptions[name]} for name in algorithms()]
 
     @app.post("/api/compress")
-    async def compress(file: UploadFile = File(...), algorithm: str = Form(...)) -> Response:
+    async def start_compression(file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
         data = await file.read(MAX_UPLOAD_SIZE + 1)
         if len(data) > MAX_UPLOAD_SIZE:
             raise HTTPException(413, "File exceeds the 256 MiB limit")
-        try:
-            container = await asyncio.to_thread(pack, data, Path(file.filename or "upload.bin").name, algorithm)
-        except (CompressionError, ValueError) as error:
-            raise HTTPException(400, str(error)) from error
-        metadata = unpack(container)
-        return Response(container, media_type="application/octet-stream", headers={"X-File-Metadata": str(_metadata("", Transfer("", container, time.time())))})
+        operation = CompressionOperation(
+            uuid.uuid4().hex,
+            Path(file.filename or "upload.bin").name,
+            len(data),
+            algorithm,
+        )
+        with operation_lock:
+            operations[operation.identifier] = operation
+        compression_executor.submit(_run_compression, operation, data)
+        return _operation_metadata(operation)
+
+    @app.get("/api/compress/{identifier}/status")
+    async def compression_status(identifier: str) -> dict:
+        operation = operations.get(identifier)
+        if operation is None:
+            raise HTTPException(404, "Compression operation not found")
+        with operation_lock:
+            return _operation_metadata(operation)
+
+    @app.post("/api/compress/{identifier}/cancel")
+    async def cancel_compression(identifier: str) -> dict:
+        operation = operations.get(identifier)
+        if operation is None:
+            raise HTTPException(404, "Compression operation not found")
+        operation.cancel_event.set()
+        with operation_lock:
+            if operation.status in {"queued", "processing"}:
+                operation.status = "cancelling"
+        return _operation_metadata(operation)
 
     @app.post("/api/transfers")
     async def create_transfer(file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:

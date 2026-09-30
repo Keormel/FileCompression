@@ -28,9 +28,16 @@ def test_web_transfer_create_inspect_download_and_verify() -> None:
     assert client.get(f"/api/transfers/{identifier}").json()["status"] == "ready"
     download = client.get(f"/api/transfers/{identifier}/download")
     assert download.status_code == 200
-    assert download.content[:4] == b"FCMP"
-    assert download.content == (STORAGE_DIR / f"{identifier}.fcmp").read_bytes()
-    assert 'filename="sample.txt.fcmp"' in download.headers["content-disposition"]
+    assert download.content == b"abcabcabc"
+    assert 'filename="sample.txt"' in download.headers["content-disposition"]
+    compressed = client.get(f"/api/transfers/{identifier}/download?compressed=true")
+    assert compressed.content[:4] == b"FCMP"
+    assert compressed.content == (STORAGE_DIR / f"{identifier}.fcmp").read_bytes()
+    assert 'filename="sample.txt.fcmp"' in compressed.headers["content-disposition"]
+    restored = client.post("/api/decompress", files={"file": ("sample.txt.fcmp", compressed.content)})
+    assert restored.status_code == 200
+    assert restored.content == b"abcabcabc"
+    assert client.post("/api/decompress", files={"file": ("junk.fcmp", b"junk")}).status_code == 422
     verified = client.post(f"/api/transfers/{identifier}/verify")
     assert verified.json()["verified"] is True
     assert verified.json()["size"] == 9
@@ -83,3 +90,20 @@ def test_web_compression_operation_reports_completion() -> None:
             return
         time.sleep(0.02)
     raise AssertionError("Compression operation did not complete")
+
+
+def test_web_recommends_best_algorithm_and_auto_compression_uses_it() -> None:
+    client = TestClient(app)
+    recommendation = client.post("/api/recommend", files={"file": ("sample.bin", b"A" * 5000)}).json()
+    assert recommendation["recommended"] in {"rle", "lzw"}
+    assert recommendation["beneficial"] is True
+    assert {item["algorithm"] for item in recommendation["estimates"]} == {"huffman", "lzw", "rle"}
+    transfers.clear()
+    response = client.post("/api/transfers", files={"file": ("отчёт.txt", b"hello world " * 500), "algorithm": (None, "auto")})
+    assert response.status_code == 200
+    transfer = response.json()
+    assert transfer["algorithm"] == transfer["recommended_algorithm"]
+    assert transfer["compression_time"] >= 0
+    download = client.get(f"/api/transfers/{transfer['id']}/download")
+    assert download.content == b"hello world " * 500
+    assert "filename*=UTF-8''%D0%BE%D1%82%D1%87%D1%91%D1%82.txt" in download.headers["content-disposition"]

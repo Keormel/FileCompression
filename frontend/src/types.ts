@@ -1,4 +1,5 @@
 export type Algorithm = 'huffman' | 'lzw' | 'rle' | 'stored'
+export type AlgorithmChoice = Algorithm | 'auto'
 
 export type Transfer = {
   id: string
@@ -11,12 +12,14 @@ export type Transfer = {
   checksum: string
   status: string
   expires_in: number
+  compression_time: number | null
+  recommended_algorithm: Algorithm | null
 }
 
 export type CompressionOperation = {
   operationId: string
   filename: string
-  algorithm: Algorithm
+  algorithm: AlgorithmChoice
   progress: number
   processedBytes: number
   totalBytes: number
@@ -25,6 +28,15 @@ export type CompressionOperation = {
   status: 'queued' | 'processing' | 'cancelling' | 'completed' | 'cancelled' | 'error'
   error: string | null
   transferId: string | null
+  recommendedAlgorithm: Algorithm | null
+  compressionTime: number | null
 }
 
 export type AlgorithmInfo = { id: Algorithm; label: string; description: string }
+
+export type Recommendation = {
+  recommended: Algorithm
+  beneficial: boolean
+  sampleSize: number
+  estimates: { algorithm: Algorithm; size: number; ratio: number }[]
+}

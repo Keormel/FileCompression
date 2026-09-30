@@ -39,3 +39,14 @@ def test_lzw_rejects_invalid_first_code() -> None:
     codec = get_algorithm("lzw")
     with pytest.raises(CorruptDataError):
         codec.decompress(b"\x01\x00", b'{"code_width":16}')
+
+
+def test_recommend_samples_large_inputs_and_picks_smallest() -> None:
+    from filecompression.recommend import SAMPLE_LIMIT, recommend, sample
+
+    assert sample(b"abc") == b"abc"
+    assert len(sample(bytes(3 * SAMPLE_LIMIT))) == SAMPLE_LIMIT
+    result = recommend(b"")
+    assert result.algorithm in {"huffman", "lzw", "rle"}
+    result = recommend(b"ab" * 4000)
+    assert result.estimates[result.algorithm] == min(result.estimates.values())

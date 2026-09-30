@@ -2,11 +2,40 @@ import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import { api } from "./api";
 import type {
-  Algorithm,
+  AlgorithmChoice,
   AlgorithmInfo,
   CompressionOperation,
+  Recommendation,
   Transfer,
 } from "./types";
+
+// Mirrors filecompression.recommend.sample: small files whole, large files as 4 evenly spaced chunks.
+const SAMPLE_LIMIT = 1024 * 1024;
+const SAMPLE_CHUNKS = 4;
+const sampleOf = (file: File): Blob => {
+  if (file.size <= SAMPLE_LIMIT) return file;
+  const chunk = SAMPLE_LIMIT / SAMPLE_CHUNKS;
+  const step = Math.floor((file.size - chunk) / (SAMPLE_CHUNKS - 1));
+  return new Blob(
+    Array.from({ length: SAMPLE_CHUNKS }, (_, index) =>
+      file.slice(index * step, index * step + chunk),
+    ),
+  );
+};
+const seconds = (value: number | null | undefined) =>
+  value == null
+    ? "n/a"
+    : value < 1
+      ? `${(value * 1000).toFixed(0)} ms`
+      : `${value.toFixed(2)} s`;
+const saveBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
 
 const bytes = (value: number) =>
   value < 1024
@@ -25,7 +54,9 @@ const Metric = ({ label, value }: { label: string; value: string }) => (
 
 export default function App() {
   const [file, setFile] = useState<File>();
-  const [algorithm, setAlgorithm] = useState<Algorithm>("lzw");
+  const [algorithm, setAlgorithm] = useState<AlgorithmChoice>("auto");
+  const [recommendation, setRecommendation] = useState<Recommendation>();
+  const [analyzing, setAnalyzing] = useState(false);
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
   const [transfer, setTransfer] = useState<Transfer>();
   const [operation, setOperation] = useState<CompressionOperation>();
@@ -58,12 +89,26 @@ export default function App() {
     () => algorithms.find((item) => item.id === algorithm),
     [algorithms, algorithm],
   );
-  const choose = (candidate?: File) => {
+  const choose = async (candidate?: File) => {
     setFile(candidate);
     setTransfer(undefined);
     setOperation(undefined);
+    setRecommendation(undefined);
+    setVerified(false);
     setError("");
+    if (!candidate) return;
+    setAlgorithm("auto");
+    setAnalyzing(true);
+    try {
+      setRecommendation(await api.recommend(sampleOf(candidate)));
+    } catch {
+      // The server still picks the best codec itself when "auto" is selected.
+    } finally {
+      setAnalyzing(false);
+    }
   };
+  const estimateFor = (id: string) =>
+    recommendation?.estimates.find((item) => item.algorithm === id);
 
   const compress = async () => {
     if (!file) {
@@ -115,23 +160,46 @@ export default function App() {
       setStatus("Cancelling...");
     }
   };
-  const download = async (id: string) => {
+  const download = async (id: string, compressed = false) => {
     setBusy(true);
     setVerified(false);
+    setError("");
     try {
-      const response = await api.download(id);
+      const response = await api.download(id, compressed);
       if (!response.ok) throw new Error();
-      const url = URL.createObjectURL(await response.blob());
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${transfer?.filename ?? "file"}.fcmp`;
-      link.click();
-      URL.revokeObjectURL(url);
-      const result = await api.verify(id);
-      setVerified(result.verified);
-      setStatus("Downloaded and SHA-256 verified");
+      const filename = transfer?.filename ?? "file";
+      saveBlob(await response.blob(), compressed ? `${filename}.fcmp` : filename);
+      // The server restores the file from the compressed archive and rejects it on SHA-256 mismatch.
+      setVerified(response.headers.get("X-Verified") === "true");
+      setStatus(
+        compressed
+          ? "Compressed archive downloaded"
+          : "Restored file downloaded and SHA-256 verified",
+      );
     } catch {
       setError("Download or verification failed.");
+      setStatus("Error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const decompress = async (archive?: File) => {
+    if (!archive) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await api.decompress(archive);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? "Decompression failed");
+      }
+      const name = archive.name.endsWith(".fcmp")
+        ? archive.name.slice(0, -5)
+        : `${archive.name}.restored`;
+      saveBlob(await response.blob(), name);
+      setStatus(`Restored ${name} and verified SHA-256`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Decompression failed");
       setStatus("Error");
     } finally {
       setBusy(false);
@@ -165,7 +233,10 @@ export default function App() {
                 disabled={busy}
                 onClick={() => download(id)}
               >
-                Download and verify
+                Download {transfer.filename}
+              </button>
+              <button disabled={busy} onClick={() => download(id, true)}>
+                Download compressed (.fcmp)
               </button>
               <p className={`status ${verified ? "success" : ""}`}>
                 {verified ? "File received and verified" : status}
@@ -240,20 +311,54 @@ export default function App() {
           </label>
           <h3>Compression algorithm</h3>
           <div className="algorithms">
+            <button
+              className={algorithm === "auto" ? "selected" : ""}
+              onClick={() => setAlgorithm("auto")}
+            >
+              <b>AUTO</b>
+              <small>
+                {analyzing
+                  ? "Analyzing file..."
+                  : recommendation
+                    ? `Best for this file: ${recommendation.recommended.toUpperCase()}`
+                    : "Picks the best algorithm for the file."}
+              </small>
+            </button>
             {algorithms
               .filter((item) => item.id !== "stored")
-              .map((item) => (
-                <button
-                  key={item.id}
-                  className={algorithm === item.id ? "selected" : ""}
-                  onClick={() => setAlgorithm(item.id)}
-                >
-                  <b>{item.label}</b>
-                  <small>{item.description}</small>
-                </button>
-              ))}
+              .map((item) => {
+                const estimate = estimateFor(item.id);
+                return (
+                  <button
+                    key={item.id}
+                    className={algorithm === item.id ? "selected" : ""}
+                    onClick={() => setAlgorithm(item.id)}
+                  >
+                    <b>
+                      {item.label}
+                      {recommendation?.recommended === item.id && (
+                        <span className="badge"> Recommended</span>
+                      )}
+                    </b>
+                    <small>
+                      {estimate && recommendation
+                        ? `~${Math.max(0, (1 - estimate.size / recommendation.sampleSize) * 100).toFixed(1)}% saved`
+                        : item.description}
+                    </small>
+                  </button>
+                );
+              })}
           </div>
-          {selectedInfo && <p className="hint">{selectedInfo.description}</p>}
+          {recommendation && (
+            <p className="hint">
+              {recommendation.beneficial
+                ? `Recommended: ${recommendation.recommended.toUpperCase()} gives the smallest result on a ${bytes(recommendation.sampleSize)} sample of this file.`
+                : "This file looks already compressed (e.g. JPG, ZIP, PDF); no algorithm will shrink it noticeably."}
+            </p>
+          )}
+          {selectedInfo && !recommendation && (
+            <p className="hint">{selectedInfo.description}</p>
+          )}
           {operation && busy && (
             <div className="operation" aria-live="polite">
               <strong>{operation.filename}</strong>
@@ -327,6 +432,18 @@ export default function App() {
                   label="Saved"
                   value={`${transfer.space_saving.toFixed(1)}%`}
                 />
+                <Metric
+                  label="Compression time"
+                  value={seconds(transfer.compression_time)}
+                />
+                <Metric
+                  label="Algorithm used"
+                  value={transfer.algorithm.toUpperCase()}
+                />
+                <Metric
+                  label="Best algorithm"
+                  value={transfer.recommended_algorithm?.toUpperCase() ?? "n/a"}
+                />
               </div>
             ) : (
               <div className="empty-metrics">
@@ -340,12 +457,35 @@ export default function App() {
                 <button onClick={() => copy(share)}>Copy link</button>
                 <button onClick={shareQrCode}>Create QR code</button>
                 <button onClick={() => download(transfer.id)} disabled={busy}>
-                  Download and verify
+                  Download {transfer.filename}
+                </button>
+                <button
+                  onClick={() => download(transfer.id, true)}
+                  disabled={busy}
+                >
+                  Download compressed (.fcmp)
                 </button>
                 {shareQr && <img className="qr share-qr" src={shareQr} alt="QR code for file sharing" />}
                 {verified && <p className="status success">SHA-256 verified</p>}
               </div>
             )}
+          </div>
+          <div className="panel history">
+            <span className="eyebrow">OPEN AN ARCHIVE</span>
+            <h2>Decompress .fcmp</h2>
+            <label className="dropzone compact">
+              <input
+                type="file"
+                accept=".fcmp"
+                disabled={busy}
+                onChange={(event) => {
+                  decompress(event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+              <b>Choose a .fcmp file</b>
+              <small>You get back the original file with its extension</small>
+            </label>
           </div>
           <div className="panel history">
             <span className="eyebrow">RECENT TRANSFERS</span>
@@ -356,7 +496,8 @@ export default function App() {
                   <b>{item.filename}</b>
                   <small>
                     {item.algorithm.toUpperCase()};{" "}
-                    {bytes(item.compressed_size)}
+                    {bytes(item.compressed_size)};{" "}
+                    {seconds(item.compression_time)}
                   </small>
                 </div>
               ))

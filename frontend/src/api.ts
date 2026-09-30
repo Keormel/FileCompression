@@ -1,4 +1,4 @@
-import type { Algorithm, AlgorithmInfo, CompressionOperation, Transfer } from './types'
+import type { Algorithm, AlgorithmChoice, AlgorithmInfo, CompressionOperation, Recommendation, Transfer } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 
@@ -20,7 +20,12 @@ export const api = {
     form.append('algorithm', algorithm)
     return request<Transfer>('/api/transfers', { method: 'POST', body: form })
   },
-  startCompression: (file: File, algorithm: Algorithm) => {
+  recommend: (sample: Blob) => {
+    const form = new FormData()
+    form.append('file', sample, 'sample.bin')
+    return request<Recommendation>('/api/recommend', { method: 'POST', body: form })
+  },
+  startCompression: (file: File, algorithm: AlgorithmChoice) => {
     const form = new FormData()
     form.append('file', file)
     form.append('algorithm', algorithm)
@@ -30,5 +35,10 @@ export const api = {
   cancelCompression: (id: string) => request<CompressionOperation>(`/api/compress/${id}/cancel`, { method: 'POST' }),
   transfer: (id: string) => request<Transfer>(`/api/transfers/${id}`),
   verify: (id: string) => request<{ verified: boolean; checksum: string; size: number }>(`/api/transfers/${id}/verify`, { method: 'POST' }),
-  download: (id: string) => fetch(`${API}/api/transfers/${id}/download`),
+  download: (id: string, compressed = false) => fetch(`${API}/api/transfers/${id}/download${compressed ? '?compressed=true' : ''}`),
+  decompress: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetch(`${API}/api/decompress`, { method: 'POST', body: form })
+  },
 }

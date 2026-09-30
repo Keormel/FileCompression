@@ -11,6 +11,7 @@ import threading
 import tempfile
 import time
 import uuid
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
 from filecompression.container import pack, unpack
 from filecompression.container.format import validate_filename
 from filecompression.errors import CompressionError
+from filecompression.recommend import recommend
 from filecompression.transfer import TransferClient
 
 try:
@@ -29,8 +31,11 @@ try:
 except ImportError:
     FastAPI = File = Form = HTTPException = UploadFile = CORSMiddleware = JSONResponse = Response = PlainTextResponse = None
 
+AUTO_ALGORITHM = "auto"
+CONTAINER_SUFFIX = ".fcmp"
 MAX_UPLOAD_SIZE = min(int(os.getenv("FILECOMP_MAX_UPLOAD_BYTES", str(MAX_DECOMPRESSED_SIZE))), MAX_DECOMPRESSED_SIZE)
 TRANSFER_TTL_SECONDS = 30 * 60
+MAX_RECOMMEND_SAMPLE = 4 * 1024 * 1024
 MAX_TRANSFERS = int(os.getenv("FILECOMP_MAX_TRANSFERS", "32"))
 MAX_TRANSFER_BYTES = int(os.getenv("FILECOMP_MAX_TRANSFER_BYTES", str(1024 * 1024 * 1024)))
 MAX_CONCURRENT_UPLOADS = int(os.getenv("FILECOMP_MAX_CONCURRENT_UPLOADS", "2"))
@@ -52,6 +57,8 @@ class Transfer:
     container_path: Path
     created_at: float
     downloaded: bool = False
+    compression_time: float | None = None
+    recommended_algorithm: str | None = None
 
     @property
     def container(self) -> bytes:
@@ -74,6 +81,8 @@ class CompressionOperation:
     status: str = "queued"
     error: str | None = None
     transfer_id: str | None = None
+    recommended_algorithm: str | None = None
+    compression_time: float | None = None
     created_at: float = field(default_factory=time.time)
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
@@ -159,6 +168,8 @@ def _operation_metadata(operation: CompressionOperation) -> dict:
         "status": operation.status,
         "error": operation.error,
         "transferId": operation.transfer_id,
+        "recommendedAlgorithm": operation.recommended_algorithm,
+        "compressionTime": operation.compression_time,
     }
 
 
@@ -178,7 +189,14 @@ def _run_compression(operation: CompressionOperation, upload_path: Path) -> None
         with operation_lock:
             operation.status = "processing"
         data = upload_path.read_bytes()
-        container = pack(data, operation.filename, operation.algorithm, progress)
+        recommended = recommend(data).algorithm
+        algorithm = recommended if operation.algorithm == AUTO_ALGORITHM else operation.algorithm
+        with operation_lock:
+            operation.recommended_algorithm = recommended
+            operation.algorithm = algorithm
+        compression_started = time.perf_counter()
+        container = pack(data, operation.filename, algorithm, progress)
+        compression_time = time.perf_counter() - compression_started
         if operation.cancel_event.is_set():
             raise RuntimeError("Compression cancelled")
         _purge_expired()
@@ -192,10 +210,11 @@ def _run_compression(operation: CompressionOperation, upload_path: Path) -> None
             temporary = path.with_suffix(".tmp")
             temporary.write_bytes(container)
             temporary.replace(path)
-            transfers[identifier] = Transfer(identifier, path, time.time())
+            transfers[identifier] = Transfer(identifier, path, time.time(), compression_time=compression_time, recommended_algorithm=recommended)
             operation.transfer_id = identifier
             operation.processed_bytes = operation.total_bytes
             operation.eta = 0.0
+            operation.compression_time = compression_time
             operation.status = "completed"
             metrics["uploads_completed"] += 1
     except RuntimeError as error:
@@ -235,7 +254,18 @@ def _metadata(identifier: str, transfer: Transfer) -> dict:
         "checksum": container.checksum,
         "status": "downloaded" if transfer.downloaded else "ready",
         "expires_in": max(0, int(TRANSFER_TTL_SECONDS - (time.time() - transfer.created_at))),
+        "compression_time": transfer.compression_time,
+        "recommended_algorithm": transfer.recommended_algorithm,
     }
+
+
+def _attachment(filename: str) -> str:
+    fallback = filename.encode("ascii", "replace").decode("ascii").replace("?", "_").replace('"', "_")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def _compressed_name(filename: str) -> str:
+    return f"{filename}{CONTAINER_SUFFIX}"
 
 
 def create_app():
@@ -296,12 +326,22 @@ def create_app():
         descriptions = {"huffman": "Frequency-based lossless compression.", "lzw": "Dictionary-based lossless compression.", "rle": "Run-length encoding for repetitive data.", "stored": "Original bytes when compression would increase size."}
         return [{"id": name, "label": name.upper(), "description": descriptions[name]} for name in algorithms()]
 
+    @app.post("/api/recommend")
+    async def recommend_algorithm(file: UploadFile = File(...)) -> dict:
+        data = await file.read(MAX_RECOMMEND_SAMPLE + 1)
+        if len(data) > MAX_RECOMMEND_SAMPLE:
+            raise HTTPException(413, "Sample is too large")
+        return (await asyncio.to_thread(recommend, data)).as_dict()
+
     @app.post("/api/compress")
-    async def start_compression(file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
+    async def start_compression(file: UploadFile = File(...), algorithm: str = Form(AUTO_ALGORITHM)) -> dict:
         try:
             filename = validate_filename(file.filename or "upload.bin")
         except CompressionError as error:
             raise HTTPException(400, str(error)) from error
+        algorithm = algorithm.lower()
+        if algorithm != AUTO_ALGORITHM and algorithm not in algorithms():
+            raise HTTPException(400, f"Unknown algorithm: {algorithm}")
         async with upload_slots:
             upload_path = await _read_upload(file)
         operation = CompressionOperation(
@@ -346,12 +386,19 @@ def create_app():
             upload_path = await _read_upload(file)
         try:
             data = upload_path.read_bytes()
+            recommended = (await asyncio.to_thread(recommend, data)).algorithm
+            if algorithm.lower() == AUTO_ALGORITHM:
+                algorithm = recommended
+            started = time.perf_counter()
             container = await asyncio.to_thread(pack, data, filename, algorithm)
+            compression_time = time.perf_counter() - started
         except (CompressionError, ValueError) as error:
             raise HTTPException(400, str(error)) from error
         finally:
             upload_path.unlink(missing_ok=True)
         identifier = _store_transfer(container)
+        transfers[identifier].compression_time = compression_time
+        transfers[identifier].recommended_algorithm = recommended
         return _metadata(identifier, transfers[identifier])
 
     @app.get("/api/transfers/{identifier}")
@@ -363,7 +410,8 @@ def create_app():
         return _metadata(identifier, transfer)
 
     @app.get("/api/transfers/{identifier}/download")
-    async def download(identifier: str) -> Response:
+    async def download(identifier: str, compressed: bool = False) -> Response:
+        """Return the original file (restored and SHA-256 checked) or, with ?compressed=true, the FCMP archive."""
         _purge_expired()
         transfer = transfers.get(identifier)
         if transfer is None:
@@ -371,10 +419,25 @@ def create_app():
         try:
             container_bytes = transfer.container
             container = await asyncio.to_thread(unpack, container_bytes)
+            body = container_bytes if compressed else await asyncio.to_thread(container.decompress)
         except CompressionError as error:
             raise HTTPException(422, str(error)) from error
         transfer.downloaded = True
-        return Response(container_bytes, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{container.filename}.fcmp"', "X-Checksum": container.checksum})
+        filename = _compressed_name(container.filename) if compressed else container.filename
+        return Response(body, media_type="application/octet-stream", headers={"Content-Disposition": _attachment(filename), "X-Checksum": container.checksum, "X-Verified": "true"})
+
+    @app.post("/api/decompress")
+    async def decompress_upload(file: UploadFile = File(...)) -> Response:
+        async with upload_slots:
+            upload_path = await _read_upload(file)
+        try:
+            container = unpack(upload_path.read_bytes())
+            restored = await asyncio.to_thread(container.decompress)
+        except CompressionError as error:
+            raise HTTPException(422, f"Not a valid FCMP archive: {error}") from error
+        finally:
+            upload_path.unlink(missing_ok=True)
+        return Response(restored, media_type="application/octet-stream", headers={"Content-Disposition": _attachment(container.filename), "X-Checksum": container.checksum, "X-Verified": "true"})
 
     @app.post("/api/transfers/{identifier}/verify")
     async def verify(identifier: str) -> dict:
@@ -449,7 +512,7 @@ def create_app():
             metadata = unpack(container)
         except (CompressionError, FileNotFoundError, OSError, ConnectionError, TimeoutError) as error:
             raise HTTPException(502, str(error)) from error
-        return Response(container, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{metadata.filename}.fcmp"'})
+        return Response(container, media_type="application/octet-stream", headers={"Content-Disposition": _attachment(_compressed_name(metadata.filename))})
 
     if frontend_index.exists():
         from fastapi.responses import FileResponse

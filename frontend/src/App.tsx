@@ -5,6 +5,7 @@ import type {
   AlgorithmChoice,
   AlgorithmInfo,
   CompressionOperation,
+  NetworkInfo,
   Recommendation,
   Transfer,
 } from "./types";
@@ -27,14 +28,19 @@ const seconds = (value: number | null | undefined) =>
     ? "n/a"
     : value < 1
       ? `${(value * 1000).toFixed(0)} ms`
-      : `${value.toFixed(2)} s`;
-const saveBlob = (blob: Blob, filename: string) => {
-  const url = URL.createObjectURL(blob);
+      : value < 60
+        ? `${value.toFixed(2)} s`
+        : value < 3600
+          ? `${Math.floor(value / 60)} min ${Math.round(value % 60)} s`
+          : `${Math.floor(value / 3600)} h ${Math.round((value % 3600) / 60)} min`;
+// The browser downloads straight to disk, so multi-gigabyte files never sit in page memory.
+const startDownload = (url: string) => {
   const link = document.createElement("a");
   link.href = url;
-  link.download = filename;
+  link.download = "";
+  document.body.appendChild(link);
   link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  link.remove();
 };
 
 const bytes = (value: number) =>
@@ -60,7 +66,8 @@ export default function App() {
   const [algorithms, setAlgorithms] = useState<AlgorithmInfo[]>([]);
   const [transfer, setTransfer] = useState<Transfer>();
   const [operation, setOperation] = useState<CompressionOperation>();
-  const [network, setNetwork] = useState<{ url: string }>();
+  const [network, setNetwork] = useState<NetworkInfo>();
+  const [uploaded, setUploaded] = useState<{ loaded: number; total: number }>();
   const [share, setShare] = useState("");
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
@@ -115,15 +122,22 @@ export default function App() {
       setError("Choose a file first.");
       return;
     }
+    if (network && file.size > network.maxUploadBytes) {
+      setError(`The server accepts files up to ${bytes(network.maxUploadBytes)}.`);
+      return;
+    }
     setBusy(true);
     setError("");
     setStatus("Uploading...");
     try {
-      let current = await api.startCompression(file, algorithm);
+      let current = await api.startCompression(file, algorithm, (loaded, total) =>
+        setUploaded({ loaded, total }),
+      );
+      setUploaded(undefined);
       setOperation(current);
       setStatus("Compressing...");
       while (!["completed", "cancelled", "error"].includes(current.status)) {
-        await new Promise((resolve) => setTimeout(resolve, 400));
+        await new Promise((resolve) => setTimeout(resolve, 1000));
         current = await api.compressionStatus(current.operationId);
         setOperation(current);
       }
@@ -148,6 +162,7 @@ export default function App() {
       setError(cause instanceof Error ? cause.message : "Compression failed");
       setStatus("Error");
     } finally {
+      setUploaded(undefined);
       setBusy(false);
     }
   };
@@ -160,48 +175,34 @@ export default function App() {
       setStatus("Cancelling...");
     }
   };
-  const download = async (id: string, compressed = false) => {
-    setBusy(true);
-    setVerified(false);
+  const download = (id: string, compressed = false) => {
     setError("");
-    try {
-      const response = await api.download(id, compressed);
-      if (!response.ok) throw new Error();
-      const filename = transfer?.filename ?? "file";
-      saveBlob(await response.blob(), compressed ? `${filename}.fcmp` : filename);
-      // The server restores the file from the compressed archive and rejects it on SHA-256 mismatch.
-      setVerified(response.headers.get("X-Verified") === "true");
-      setStatus(
-        compressed
-          ? "Compressed archive downloaded"
-          : "Restored file downloaded and SHA-256 verified",
-      );
-    } catch {
-      setError("Download or verification failed.");
-      setStatus("Error");
-    } finally {
-      setBusy(false);
-    }
+    // The server restores the file while streaming and checks SHA-256 before the last
+    // block is sent; on a mismatch the connection is aborted and the browser marks the download failed.
+    startDownload(api.downloadUrl(id, compressed));
+    setVerified(!compressed);
+    setStatus(
+      compressed
+        ? "Compressed archive download started"
+        : "Download started; SHA-256 is verified while streaming",
+    );
   };
   const decompress = async (archive?: File) => {
     if (!archive) return;
     setBusy(true);
     setError("");
+    setStatus("Uploading archive...");
     try {
-      const response = await api.decompress(archive);
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail ?? "Decompression failed");
-      }
-      const name = archive.name.endsWith(".fcmp")
-        ? archive.name.slice(0, -5)
-        : `${archive.name}.restored`;
-      saveBlob(await response.blob(), name);
-      setStatus(`Restored ${name} and verified SHA-256`);
+      const imported = await api.importArchive(archive, (loaded, total) =>
+        setUploaded({ loaded, total }),
+      );
+      startDownload(api.downloadUrl(imported.id));
+      setStatus(`Restoring ${imported.filename}; SHA-256 is verified while streaming`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Decompression failed");
       setStatus("Error");
     } finally {
+      setUploaded(undefined);
       setBusy(false);
     }
   };
@@ -284,6 +285,9 @@ export default function App() {
               Show QR
             </button>
           </div>
+          {network && network.urls.length > 1 && (
+            <small>Also: {network.urls.filter((url) => url !== network.url).join(", ")}</small>
+          )}
           {qr && <img className="qr" src={qr} alt="QR code" />}
         </div>
       </section>
@@ -359,6 +363,16 @@ export default function App() {
           {selectedInfo && !recommendation && (
             <p className="hint">{selectedInfo.description}</p>
           )}
+          {uploaded && (
+            <div className="operation" aria-live="polite">
+              <strong>Uploading to server</strong>
+              <progress value={uploaded.loaded} max={Math.max(uploaded.total, 1)} />
+              <span>{((uploaded.loaded / Math.max(uploaded.total, 1)) * 100).toFixed(1)}%</span>
+              <small>
+                {bytes(uploaded.loaded)} / {bytes(uploaded.total)}
+              </small>
+            </div>
+          )}
           {operation && busy && (
             <div className="operation" aria-live="polite">
               <strong>{operation.filename}</strong>
@@ -381,7 +395,7 @@ export default function App() {
                 ; ETA{" "}
                 {operation.eta === null
                   ? "Calculating time..."
-                  : `${operation.eta.toFixed(1)} sec`}
+                  : seconds(operation.eta)}
                 ; {operation.status}
               </small>
               <button type="button" onClick={cancel}>
@@ -396,11 +410,17 @@ export default function App() {
           >
             {busy ? (
               <span className="compress-button-content">
-                <span>Compressing {operation?.progress.toFixed(0) ?? 0}%</span>
+                <span>
+                  {operation
+                    ? `Compressing ${operation.progress.toFixed(0)}%`
+                    : `Uploading ${uploaded ? ((uploaded.loaded / Math.max(uploaded.total, 1)) * 100).toFixed(0) : 0}%`}
+                </span>
                 <span className="compress-button-track">
                   <span
                     className="compress-button-fill"
-                    style={{ width: `${operation?.progress ?? 0}%` }}
+                    style={{
+                      width: `${operation?.progress ?? (uploaded ? (uploaded.loaded / Math.max(uploaded.total, 1)) * 100 : 0)}%`,
+                    }}
                   />
                 </span>
               </span>

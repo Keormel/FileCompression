@@ -4,14 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "filecompression"
-version = "0.1.0"
+version = "0.2.0"
 description = "Educational lossless file compression and transfer system"
 requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.7"]
-web = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "python-multipart>=0.0.9"]
+# uvloop/httptools only where wheels exist (x86_64, 64-bit ARM); 32-bit ARM falls back to pure Python.
+web = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
+    "uvloop>=0.19; sys_platform != 'win32' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "httptools>=0.6; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'AMD64'",
+]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "matplotlib>=3.8", "httpx>=0.27"]
 
 [project.scripts]

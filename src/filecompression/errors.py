@@ -8,3 +8,7 @@ class CorruptDataError(CompressionError):
 
 class ContainerError(CompressionError):
     """Raised when a container is invalid or unsupported."""
+
+
+class OperationCancelled(Exception):
+    """Raised when a long-running streaming operation is cancelled by the caller."""

@@ -42,7 +42,7 @@ def run(paths: list[Path], output: Path) -> list[dict]:
                 _, peak_memory = tracemalloc.get_traced_memory()
                 tracemalloc.stop()
                 size = len(container)
-                result = {"file": path.name, "file_type": path.suffix.lstrip(".") or "bin", "algorithm": algorithm, "original_size": len(data), "compressed_size": size, "payload_size": len(unpack(container).payload), "compression_ratio": len(data) / size if size else 0, "space_saving_percent": (1 - size / len(data)) * 100 if data else 0, "compression_time": compress_seconds, "decompression_time": decompress_seconds, "compression_throughput": len(data) / compress_seconds if compress_seconds else 0, "decompression_throughput": len(data) / decompress_seconds if decompress_seconds else 0, "peak_memory": peak_memory}
+                result = {"file": path.name, "file_type": path.suffix.lstrip(".") or "bin", "algorithm": algorithm, "original_size": len(data), "compressed_size": size, "payload_size": unpack(container).payload_size, "compression_ratio": len(data) / size if size else 0, "space_saving_percent": (1 - size / len(data)) * 100 if data else 0, "compression_time": compress_seconds, "decompression_time": decompress_seconds, "compression_throughput": len(data) / compress_seconds if compress_seconds else 0, "decompression_throughput": len(data) / decompress_seconds if decompress_seconds else 0, "peak_memory": peak_memory}
                 results.append(result)
                 writer.writerow(result.values())
     output.with_suffix(".json").write_text(json.dumps({"python": platform.python_version(), "platform": platform.platform(), "results": results}, indent=2), encoding="utf-8")

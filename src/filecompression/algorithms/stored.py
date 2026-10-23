@@ -12,7 +12,7 @@ class StoredAlgorithm(CompressionAlgorithm):
             progress(len(data), len(data))
         return data, b""
 
-    def decompress(self, payload: bytes, metadata: bytes) -> bytes:
-        if metadata or len(payload) > MAX_DECOMPRESSED_SIZE:
+    def decompress(self, payload: bytes, metadata: bytes, limit: int = MAX_DECOMPRESSED_SIZE) -> bytes:
+        if metadata or len(payload) > min(limit, MAX_DECOMPRESSED_SIZE):
             raise CorruptDataError("Invalid stored stream")
-        return payload
+        return bytes(payload)

@@ -7,7 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .container import pack, unpack
+from .container import iter_decompress, pack_stream, unpack_stream
+from .parallel import shared_executor
 
 
 @dataclass(frozen=True)
@@ -27,38 +28,54 @@ class CompressionStats:
 
 
 def compress_file(source: Path, destination: Path, algorithm: str) -> CompressionStats:
-    from .algorithms.base import MAX_DECOMPRESSED_SIZE
-    if source.stat().st_size > MAX_DECOMPRESSED_SIZE:
-        raise ValueError("Input file exceeds the 256 MiB safety limit")
-    data = source.read_bytes()
+    """Stream ``source`` into an FCMP container; memory use does not depend on the file size."""
+    executor = shared_executor()
     started = time.perf_counter()
-    container = pack(data, source.name, algorithm)
+    with source.open("rb") as reader, _atomic_writer(destination) as writer:
+        info = pack_stream(reader, writer, source.name, algorithm, executor=executor)
     compression_time = time.perf_counter() - started
-    _atomic_write(destination, container)
+    # Restore once without writing anything to confirm the archive and measure decoding speed.
     started = time.perf_counter()
-    unpack(container).decompress()
+    with destination.open("rb") as reader:
+        for _ in iter_decompress(reader, executor=executor):
+            pass
     decompression_time = time.perf_counter() - started
-    return CompressionStats(len(data), len(container), compression_time, decompression_time)
+    return CompressionStats(info.original_size, info.compressed_size, compression_time, decompression_time)
 
 
 def decompress_file(source: Path, destination: Path) -> None:
-    _atomic_write(destination, unpack(source.read_bytes()).decompress())
+    with source.open("rb") as reader, _atomic_writer(destination) as writer:
+        unpack_stream(reader, writer, executor=shared_executor())
 
 
-def _atomic_write(destination: Path, data: bytes) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(prefix=f".{destination.name}.", dir=destination.parent, delete=False)
-    temporary = Path(handle.name)
-    try:
-        with handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(destination)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+class _atomic_writer:
+    """Write to a temporary file next to ``destination`` and rename it into place on success."""
+
+    def __init__(self, destination: Path) -> None:
+        self.destination = destination
+
+    def __enter__(self):
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = tempfile.NamedTemporaryFile(prefix=f".{self.destination.name}.", dir=self.destination.parent, delete=False)
+        return self.handle
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        temporary = Path(self.handle.name)
+        try:
+            if exc_type is None:
+                self.handle.flush()
+                os.fsync(self.handle.fileno())
+            self.handle.close()
+            if exc_type is None:
+                temporary.replace(self.destination)
+        finally:
+            if exc_type is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

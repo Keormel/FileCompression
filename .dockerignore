@@ -9,3 +9,10 @@ __pycache__
 .coverage
 benchmark-results
 *.pyc
+data
+.env
+*.fcmp
+.github
+docs
+benchmarks
+tests

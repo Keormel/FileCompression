@@ -40,3 +40,12 @@ export type Recommendation = {
   sampleSize: number
   estimates: { algorithm: Algorithm; size: number; ratio: number }[]
 }
+
+export type NetworkInfo = {
+  host: string
+  port: number
+  url: string
+  urls: string[]
+  mdns: string | null
+  maxUploadBytes: number
+}

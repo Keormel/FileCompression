@@ -1,124 +1,452 @@
-# FileCompression
+# FileComp
 
-Учебная система сжатия и передачи файлов между двумя пользователями. Проект реализует три алгоритма сжатия без потерь самостоятельно: Huffman, LZW и RLE.
+Система сжатия и передачи файлов внутри локальной сети. Алгоритмы сжатия без потерь — Huffman, LZW и RLE — реализованы в проекте самостоятельно, без сторонних библиотек сжатия.
 
-## Реализовано
+Сервис рассчитан на работу на мини-сервере, например на Raspberry Pi. На него загружают файл с одного устройства, сервер сжимает файл и выдаёт ссылку и QR-код. С другого устройства в той же сети по ссылке скачивают исходный файл (проверенный по SHA-256) или сжатый архив `.fcmp`.
 
-- бинарное сжатие и восстановление файлов;
-- собственный контейнер `FCMP` с версией, алгоритмом, размером, именем и SHA-256;
-- TCP relay-сервер и два клиента с очередью входящих файлов;
-- CLI для сжатия и распаковки;
-- unit/integration-тесты и CSV benchmark.
+## Содержание
 
-## Требования и установка
+- [Возможности](#возможности)
+- [Быстрый старт на Raspberry Pi](#быстрый-старт-на-raspberry-pi)
+- [Как пользоваться](#как-пользоваться)
+- [Управление сервисом](#управление-сервисом)
+- [Настройки](#настройки)
+- [Локальная сеть](#локальная-сеть)
+- [Большие файлы и производительность](#большие-файлы-и-производительность)
+- [Запуск без Docker и разработка](#запуск-без-docker-и-разработка)
+- [CLI, TCP relay и GUI](#cli-tcp-relay-и-gui)
+- [HTTP API](#http-api)
+- [Формат FCMP](#формат-fcmp)
+- [Тесты и бенчмарки](#тесты-и-бенчмарки)
+- [Архитектура](#архитектура)
+- [Решение проблем](#решение-проблем)
+- [Ограничения](#ограничения)
 
-Нужен Python 3.12 или новее. Установка пакета из корня проекта:
+## Возможности
 
-```text
-.venv\Scripts\python.exe -m pip install -e .
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
+- Сжатие алгоритмами Huffman, LZW и RLE. В режиме **AUTO** алгоритм подбирается по выборке из файла.
+- Собственный контейнер **FCMP v2**. Файл разбивается на блоки, у каждого блока свой алгоритм, весь файл проверяется по SHA-256.
+- **Файлы любого размера.** Загрузка, сжатие и скачивание идут потоком, расход памяти не зависит от размера файла.
+- Параллельное сжатие блоков на всех ядрах процессора.
+- Веб-интерфейс: прогресс загрузки и сжатия, ссылки для обмена, QR-коды, распаковка `.fcmp`.
+- Автоматически определяет свой адрес в локальной сети, чтобы ссылки работали с других устройств.
+- Docker-образ под `amd64`, `arm64` и `armv7` (Raspberry Pi 3/4/5).
+- CLI, TCP relay-сервер, десктопный GUI, тесты и бенчмарки.
+
+---
+
+## Быстрый старт на Raspberry Pi
+
+### Что понадобится
+
+| | Минимум | Рекомендуется |
+|---|---|---|
+| Плата | Raspberry Pi 3 | Raspberry Pi 4 или 5 |
+| Память | 1 ГБ | 2 ГБ и больше |
+| ОС | Raspberry Pi OS (32 или 64 бит) | Raspberry Pi OS Lite 64-bit |
+| Хранилище | SD-карта | USB SSD или HDD для файлов |
+| Сеть | Wi-Fi | Ethernet |
+
+SD-карта подходит для системы, но для больших файлов медленная и быстро изнашивается. Файлы лучше хранить на внешнем диске (см. [шаг 3](#шаг-3-внешний-диск-по-желанию)).
+
+### Шаг 1. Подготовить Pi
+
+1. Запишите Raspberry Pi OS через **Raspberry Pi Imager**. В его настройках задайте имя хоста (например, `filecomp`), пользователя, пароль, Wi-Fi и включите SSH.
+2. Подключите Pi к той же сети, что и устройства, между которыми нужно передавать файлы.
+3. Зайдите на Pi по SSH:
+
+   ```bash
+   ssh <пользователь>@filecomp.local
+   ```
+
+4. Обновите систему и установите git:
+
+   ```bash
+   sudo apt update && sudo apt full-upgrade -y
+   sudo apt install -y git
+   ```
+
+5. Желательно закрепить за Pi постоянный IP-адрес. Это делается в настройках роутера (DHCP-резервирование по MAC-адресу) — тогда ссылки и QR-коды не будут меняться.
+
+### Шаг 2. Установить FileComp
+
+```bash
+git clone <адрес-репозитория> filecompression
+cd filecompression
+./scripts/raspberry-pi/install.sh
 ```
 
-## CLI
+Что делает скрипт:
 
-```text
-.venv\Scripts\python.exe -m filecompression.cli compress input.bin output.fcmp --algorithm huffman
-.venv\Scripts\python.exe -m filecompression.cli decompress output.fcmp restored.bin
+1. Ставит Docker, если его нет, и добавляет вас в группу `docker`.
+2. Создаёт `.env` из `.env.example` и прописывает ваши `PUID` и `PGID`.
+3. Создаёт каталог для файлов (по умолчанию `./data`).
+4. Собирает образ и запускает контейнер. Первая сборка на Pi занимает несколько минут.
+5. Выводит адреса, по которым сервис открывается.
+
+Если скрипт только что установил Docker, выйдите из SSH и зайдите снова — права группы `docker` применяются после нового входа. До этого скрипт сам использует `sudo docker`.
+
+<details>
+<summary>Установка вручную, без скрипта</summary>
+
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER      # затем выйти и зайти снова
+
+cp .env.example .env
+nano .env                          # PUID/PGID = вывод `id -u` и `id -g`
+mkdir -p data
+docker compose up -d --build
 ```
 
-CLI показывает размеры, коэффициент сжатия, экономию и время обработки. Размером передачи считается полный контейнер, включая заголовок и метаданные. Для случайных или уже сжатых данных размер может увеличиться.
+</details>
 
-## Передача
+### Шаг 3. Внешний диск (по желанию)
 
-Сервер и клиентский API находятся в `src/filecompression/transfer`. Сервер поддерживает именованных пользователей, принимает контейнер от отправителя и помещает его во входящую очередь получателя. Используется TCP с 4-байтным big-endian размером каждого фрейма.
+```bash
+lsblk                                    # найти диск, например /dev/sda1
+sudo mkdir -p /mnt/ssd
+sudo mount /dev/sda1 /mnt/ssd            # для постоянного монтирования добавьте запись в /etc/fstab
+sudo mkdir -p /mnt/ssd/filecomp
+sudo chown $(id -u):$(id -g) /mnt/ssd/filecomp
+```
 
-## Web interface
+В `.env` укажите путь к каталогу и перезапустите контейнер:
 
-Соберите React UI и запустите FastAPI Web server:
+```bash
+FILECOMP_DATA_DIR=/mnt/ssd/filecomp
+```
+
+```bash
+docker compose up -d
+```
+
+### Шаг 4. Открыть с другого устройства
+
+С любого телефона или компьютера в той же сети:
+
+- `http://<IP-адрес Pi>:8000` — например `http://192.168.1.50:8000`;
+- `http://filecomp.local:8000` — по имени хоста. На некоторых Android и Windows имена `.local` не работают, тогда используйте IP.
+
+Узнать IP Pi можно командой `hostname -I`, в логе контейнера (`docker compose logs | grep reachable`) или в шапке веб-интерфейса — там есть кнопки «Copy address» и «Show QR».
+
+Проверить, что сервис жив:
+
+```bash
+curl http://localhost:8000/api/health
+```
+
+---
+
+## Как пользоваться
+
+**Отправить файл:**
+
+1. Откройте FileComp в браузере.
+2. Перетащите файл в область **Send a file** или выберите его. Сервер проанализирует выборку из файла и подскажет лучший алгоритм.
+3. Оставьте **AUTO** или выберите алгоритм вручную.
+4. Нажмите **Compress and create transfer**. Сначала показывается прогресс загрузки, затем прогресс сжатия со скоростью и оставшимся временем. Операцию можно отменить.
+5. Справа появятся результат и ссылка. Скопируйте её (**Copy link**) или покажите QR-код (**Create QR code**) получателю.
+
+**Получить файл:**
+
+1. Откройте ссылку `http://<адрес>:8000/share/<id>`.
+2. **Download** — исходный файл. Сервер восстанавливает его на лету и сверяет SHA-256. Если данные повреждены, скачивание обрывается и браузер показывает ошибку.
+3. **Download compressed (.fcmp)** — сжатый архив. Скачивание архива можно возобновлять.
+
+**Распаковать `.fcmp`:** в блоке **Decompress .fcmp** выберите архив. Он загрузится на сервер, после чего браузер начнёт скачивание восстановленного файла.
+
+Передачи хранятся 30 минут (настраивается через `FILECOMP_TRANSFER_TTL_SECONDS`), затем удаляются автоматически.
+
+---
+
+## Управление сервисом
+
+Все команды выполняются из каталога проекта.
+
+| Задача | Команда |
+|---|---|
+| Статус | `docker compose ps` |
+| Логи | `docker compose logs -f` |
+| Остановить | `docker compose down` |
+| Запустить | `docker compose up -d` |
+| Перезапустить после правки `.env` | `docker compose up -d` |
+| Обновить до новой версии | `git pull && docker compose up -d --build` |
+| Состояние и свободное место | `curl localhost:8000/api/health` |
+| Метрики (формат Prometheus) | `curl localhost:8000/metrics` |
+| Удалить все передачи | `docker compose down && rm -f data/*.fcmp && docker compose up -d` |
+
+Контейнер запускается вместе с Pi автоматически (`restart: unless-stopped`).
+
+---
+
+## Настройки
+
+Все параметры задаются в файле `.env`. Шаблон с комментариями — `.env.example`. После изменения выполните `docker compose up -d`.
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `PUID`, `PGID` | `1000` | От какого пользователя работает контейнер. Он должен владеть каталогом данных |
+| `FILECOMP_DATA_DIR` | `./data` | Где на хосте хранятся файлы |
+| `FILECOMP_WEB_PORT` | `8000` | Порт веб-интерфейса |
+| `FILECOMP_PUBLIC_HOST` | — | Явно заданный LAN-адрес для ссылок, например `192.168.1.50` |
+| `FILECOMP_PUBLIC_URL` | — | Полный адрес для ссылок, например `http://files.lan` (используется за reverse proxy) |
+| `FILECOMP_WORKERS` | число ядер | Сколько процессов сжимают блоки параллельно |
+| `FILECOMP_MAX_CONCURRENT_COMPRESSIONS` | `1` | Сколько файлов сжимается одновременно; остальные ждут в очереди |
+| `FILECOMP_MAX_CONCURRENT_UPLOADS` | `2` | Сколько загрузок принимается одновременно |
+| `FILECOMP_MAX_UPLOAD_BYTES` | `4294967296` (4 ГиБ) | Максимальный размер одного файла |
+| `FILECOMP_MAX_TRANSFER_BYTES` | `17179869184` (16 ГиБ) | Общий объём хранимых архивов |
+| `FILECOMP_MAX_TRANSFERS` | `32` | Максимальное число хранимых передач |
+| `FILECOMP_MIN_FREE_BYTES` | `536870912` (512 МиБ) | Сколько места на диске должно остаться свободным; иначе загрузка отклоняется |
+| `FILECOMP_TRANSFER_TTL_SECONDS` | `1800` | Сколько секунд живёт передача |
+| `FILECOMP_LOG_LEVEL` | `INFO` | Уровень логирования |
+| `FILECOMP_API_KEY` | — | Если задан, все `/api/*`, кроме health, требуют заголовок `X-API-Key`. Встроенный веб-интерфейс этот заголовок не отправляет |
+| `FILECOMP_RATE_LIMIT_REQUESTS` / `_WINDOW_SECONDS` | `120` / `60` | Ограничение POST/DELETE-запросов с одного IP. Опрос прогресса не ограничивается |
+| `FILECOMP_ALLOWED_ORIGINS` | localhost:5173 | CORS. Нужен только для dev-сервера фронтенда |
+| `FILECOMP_ENABLE_SESSIONS`, `FILECOMP_TRANSFER_HOST` | `false` | Доступ к TCP relay из веб-API. Держите выключенным |
+
+Типовые настройки:
+
+- **Pi с 1 ГБ RAM или сильный нагрев:** `FILECOMP_WORKERS=2`.
+- **Большой внешний диск:** увеличьте `FILECOMP_MAX_UPLOAD_BYTES` и `FILECOMP_MAX_TRANSFER_BYTES`.
+- **Передачи нужны дольше:** `FILECOMP_TRANSFER_TTL_SECONDS=86400` (сутки).
+
+---
+
+## Локальная сеть
+
+Контейнер запускается с `network_mode: host` и использует сеть Raspberry Pi напрямую:
+
+- приложение видит реальные интерфейсы `eth0` и `wlan0`, поэтому ссылки и QR-коды содержат LAN-адрес Pi, а не внутренний адрес Docker (`172.17.x.x`);
+- пробрасывать порты не нужно — сервис сразу слушает порт `8000` на Pi;
+- имя `<hostname>.local` работает через avahi, который в Raspberry Pi OS включён по умолчанию.
+
+Адрес для ссылок выбирается в таком порядке:
+
+1. `FILECOMP_PUBLIC_URL`, если задан.
+2. `FILECOMP_PUBLIC_HOST`, если задан.
+3. IP-адрес, по которому браузер открыл страницу (если это не `localhost`).
+4. Автоматически найденный адрес: по маршруту по умолчанию и по сетевым интерфейсам. Интернет для этого не нужен, адреса `192.168.x.x` и `10.x.x.x` в приоритете.
+
+Все найденные адреса показывает `GET /api/network-info` и выводит лог при старте.
+
+**Docker Desktop (Windows, macOS).** Там host-сеть недоступна, поэтому используйте bridge-вариант и задайте в `.env` IP компьютера: `FILECOMP_PUBLIC_HOST=192.168.1.15`.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
+```
+
+**Брандмауэр.** Если на Pi включён `ufw`, откройте порт: `sudo ufw allow 8000/tcp`.
+
+---
+
+## Большие файлы и производительность
+
+- **Память.** Загрузка пишется на диск потоком, сжатие и распаковка идут блоками по 1 МиБ, скачивание отдаётся потоком. Весь сервис с 4 процессами сжатия занимает около 250–300 МБ RAM, и это не зависит от размера файла. Проверено на файле 1 ГиБ.
+- **Скорость.** Алгоритмы написаны на чистом Python, поэтому скорость упирается в процессор. Блоки сжимаются параллельно в `FILECOMP_WORKERS` процессах. На настольном ПК с 4 процессами 1 ГиБ смешанных данных сжался за ~1 минуту (около 19 МБ/с). Raspberry Pi 4 будет в несколько раз медленнее — это оценка, на Pi не замерялось. Pi 5 заметно быстрее Pi 4.
+- **Диск.** Во время сжатия на диске одновременно лежат загруженный файл и создаваемый архив, поэтому свободного места нужно примерно вдвое больше размера файла.
+- **Охлаждение.** При долгом сжатии Pi нагружает все ядра. Без радиатора или вентилятора процессор снижает частоту, и сжатие замедляется.
+- **Уже сжатые данные** (JPG, MP4, ZIP, PDF) почти не уменьшаются. Такие блоки сохраняются без сжатия (`stored`), так что архив получается лишь немного больше исходника.
+
+---
+
+## Запуск без Docker и разработка
+
+Нужны Python 3.12+ и Node.js 22+.
+
+**Linux, macOS, Raspberry Pi:**
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[web,dev]"
+
+cd frontend && npm ci && npm run build && cd ..
+
+.venv/bin/filecompression-web --host 0.0.0.0 --port 8000
+```
+
+**Windows:**
 
 ```text
-cd frontend
-npm install
-npm run build
-cd ..
-.venv\Scripts\python.exe -m pip install -e ".[web]"
+python -m venv .venv
+.venv\Scripts\pip install -e ".[web,dev]"
+cd frontend && npm ci && npm run build && cd ..
 .venv\Scripts\filecompression-web.exe --host 0.0.0.0 --port 8000
 ```
 
-Откройте `http://localhost:8000` на первом компьютере. Для второго устройства используйте URL из `GET /api/network-info`, например `http://192.168.1.15:8000`. Web UI создаёт share links, выполняет асинхронное сжатие с реальным progress и скачивает восстановленный исходный файл после FCMP/SHA-256 проверки. Transfer-хранилище in-memory и истекает через 30 минут.
+Файлы сохраняются в `./data`; другой каталог задаётся через `FILECOMP_STORAGE_DIR`.
 
-Запуск сервера после установки пакета:
+**Разработка фронтенда с горячей перезагрузкой.** Запустите бэкенд на порту 8000, затем:
 
-```text
-.venv\Scripts\filecompression-server.exe --host 127.0.0.1 --port 8765
+```bash
+cd frontend
+npm run dev        # http://localhost:5173, запросы /api проксируются на :8000
 ```
 
-Минимальный графический клиент запускается так:
+**Сборка образа для Pi на ПК** — быстрее, чем собирать на самой плате:
 
-```text
-.venv\Scripts\python.exe -m pip install -e ".[gui]"
-.venv\Scripts\python.exe -m filecompression.gui.app
+```bash
+docker buildx build --platform linux/arm64 -t filecompression:latest \
+  -o type=docker,dest=filecompression-arm64.tar .
+scp filecompression-arm64.tar <пользователь>@filecomp.local:~
+
+# на Pi, в каталоге проекта:
+docker load -i ~/filecompression-arm64.tar
+docker compose up -d
 ```
 
-Сетевой транспорт предназначен для учебной локальной демонстрации: аутентификация и шифрование пока не входят в область проекта.
+Для 32-битной Raspberry Pi OS используйте `--platform linux/arm/v7`.
 
-## Benchmark и тесты
+---
 
-```text
-.venv\Scripts\python.exe benchmarks/compression_benchmark.py data/sample.txt data/sample.bin
-.venv\Scripts\python.exe benchmarks/compression_benchmark.py --generate-fixtures benchmark-results/fixtures --output benchmark-results/benchmark_results.csv
-.venv\Scripts\python.exe benchmarks/generate_plots.py benchmark-results/benchmark_results.csv
-.venv\Scripts\python.exe -m pytest
+## CLI, TCP relay и GUI
+
+**CLI** — сжатие и распаковка файлов любого размера:
+
+```bash
+.venv/bin/filecompression compress input.bin output.fcmp --algorithm huffman   # huffman | lzw | rle
+.venv/bin/filecompression decompress output.fcmp restored.bin
 ```
 
-Benchmark формирует CSV с фактическими размерами, коэффициентами и временами для каждого алгоритма. Численные результаты не должны добавляться в документацию вручную.
+CLI выводит размеры, коэффициент сжатия, экономию, время сжатия и время контрольной распаковки.
+
+**TCP relay** — учебный сервер передачи между именованными пользователями. Протокол: TCP, перед каждым фреймом его размер в 4 байтах big-endian. Описание — в `docs/protocol.md`.
+
+```bash
+.venv/bin/filecompression-server --host 127.0.0.1 --port 8765
+```
+
+**GUI-клиент** (PySide6) для relay-сервера:
+
+```bash
+.venv/bin/pip install -e ".[gui]"
+.venv/bin/python -m filecompression.gui.app
+```
+
+Relay и GUI передают контейнер целиком в памяти, лимит — 256 МиБ. Большие файлы передавайте через веб-интерфейс.
+
+---
+
+## HTTP API
+
+Интерактивная документация доступна на запущенном сервере: `http://<адрес>:8000/docs`.
+
+| Метод и путь | Назначение |
+|---|---|
+| `GET /api/health` | Состояние, активные операции, занятое и свободное место, число воркеров |
+| `GET /api/network-info` | LAN-адреса сервиса и максимальный размер загрузки |
+| `GET /api/algorithms` | Список алгоритмов |
+| `POST /api/recommend` | Рекомендация алгоритма по выборке (multipart, до 4 МиБ) |
+| `POST /api/compress/stream?filename=&algorithm=` | Загрузка файла «сырым» телом запроса и запуск сжатия. Рекомендуемый способ |
+| `POST /api/compress` | То же через multipart (`file`, `algorithm`) |
+| `GET /api/compress/{id}/status` | Прогресс, скорость, ETA, `transferId` по завершении |
+| `POST /api/compress/{id}/cancel` | Отмена сжатия |
+| `POST /api/transfers` | Синхронное сжатие через multipart. Удобно для маленьких файлов |
+| `GET /api/transfers/{id}` | Метаданные передачи |
+| `GET /api/transfers/{id}/download` | Восстановленный файл (поток с проверкой SHA-256) |
+| `GET /api/transfers/{id}/download?compressed=true` | Архив `.fcmp`, поддерживает докачку |
+| `POST /api/transfers/{id}/verify` | Полная проверка архива |
+| `POST /api/archives?filename=` | Загрузить `.fcmp` «сырым» телом запроса; он станет передачей |
+| `POST /api/decompress` | Распаковать загруженный `.fcmp` (multipart), ответ — поток |
+| `GET /metrics` | Счётчики в формате Prometheus |
+
+Пример работы через `curl`:
+
+```bash
+# загрузить и сжать
+curl -X POST --data-binary @video.mov \
+  "http://filecomp.local:8000/api/compress/stream?filename=video.mov&algorithm=auto"
+# → {"operationId": "...", ...}
+
+curl http://filecomp.local:8000/api/compress/<operationId>/status
+# → {"status": "completed", "transferId": "...", ...}
+
+curl -OJ http://filecomp.local:8000/api/transfers/<transferId>/download
+```
+
+---
+
+## Формат FCMP
+
+FCMP v2 — блочный поток:
+
+```text
+заголовок  magic "FCMP", версия 2, алгоритм, исходный размер, длина имени, размер блока
+имя        UTF-8 имя файла
+блоки      [алгоритм, исходная длина, длина metadata, длина payload] + metadata + payload
+конец      нулевой заголовок блока
+трейлер    SHA-256 исходных данных
+```
+
+Каждый блок (по умолчанию 1 МиБ) сжимается независимо. Если сжатие блок не уменьшает, он сохраняется как `stored`. При распаковке проверяются структура, длины блоков, имя файла, итоговый размер и SHA-256. Архивы старой версии 1 по-прежнему читаются. Подробнее — в `docs/container-format.md`.
+
+---
+
+## Тесты и бенчмарки
+
+```bash
+.venv/bin/python -m pytest
+
+.venv/bin/python benchmarks/compression_benchmark.py --generate-fixtures benchmark-results/fixtures \
+  --output benchmark-results/benchmark_results.csv
+.venv/bin/python benchmarks/generate_plots.py benchmark-results/benchmark_results.csv
+```
+
+Бенчмарк сохраняет в CSV фактические размеры, коэффициенты сжатия, время и пиковую память для каждого алгоритма. Численные результаты не вносятся в документацию вручную.
+
+CI (`.github/workflows/ci.yml`) прогоняет тесты, собирает фронтенд и Docker-образ для `linux/amd64`, `linux/arm64` и `linux/arm/v7`.
+
+---
 
 ## Архитектура
 
 ```text
 src/filecompression/
-├── algorithms/   Huffman, LZW, RLE и общий интерфейс
-├── container/    бинарный контейнер FCMP и checksum
-├── transfer/     TCP-протокол, сервер и клиент
-├── service.py    файловые операции и статистика
-└── cli.py        консольный интерфейс
-tests/            round-trip и integration-тесты
-benchmarks/       воспроизводимые измерения
+├── algorithms/      Huffman, LZW, RLE, stored и общий интерфейс кодеков
+├── container/       формат FCMP: потоковые запись, чтение и проверка
+├── parallel.py      пул процессов для параллельного сжатия блоков
+├── recommend.py     выбор алгоритма по выборке из файла
+├── service.py       потоковые операции с файлами (используется CLI)
+├── web/             FastAPI: API, хранилище передач, определение LAN-адреса
+├── transfer/        TCP relay: протокол, сервер, клиент
+├── gui/             десктопный клиент на PySide6
+└── cli.py           консольный интерфейс
+frontend/            React + Vite веб-интерфейс
+scripts/raspberry-pi/install.sh   установка на Pi
+docker-compose.yml               запуск в host-сети (Pi, Linux)
+docker-compose.bridge.yml        вариант для Docker Desktop
+tests/, benchmarks/, docs/
 ```
 
-## Формат контейнера
+Сервер работает одним процессом uvicorn: состояние операций хранится в его памяти, а параллельное сжатие обеспечивает отдельный пул процессов. Готовые архивы лежат на диске и подхватываются после перезапуска. Незавершённые загрузки, оставшиеся после сбоя или отключения питания, удаляются при старте.
 
-Заголовок использует фиксированный big-endian формат: `FCMP`, версия, идентификатор алгоритма, flags, исходный размер, длина имени, SHA-256, длина метаданных и длина payload. После заголовка последовательно находятся UTF-8 имя файла, метаданные алгоритма и сжатые байты. Huffman хранит частотную таблицу; LZW хранит ширину кода; RLE не требует дополнительных параметров.
+Материалы курсовой — в `docs/coursework/`, диаграммы Mermaid — в `docs/diagrams/`.
 
-При распаковке проверяются версия, длины, имя файла, размер восстановленных данных и SHA-256. Ошибки повреждения контейнера не принимаются за успешное восстановление.
+---
 
-## Ограничения текущего этапа
+## Решение проблем
 
-GUI поддерживает выбор файла и алгоритма, сжатие, статистику, подключение, отправку, получение, распаковку и проверку SHA-256. Операции выполняются в отдельном worker-thread; progress bar использует indeterminate-состояние для операций, где точный прогресс не передается backend. Для PNG, JPEG и PDF benchmark использует воспроизводимые fixtures из `tests/fixtures`; репозиторий не содержит copyrighted material.
+| Симптом | Что сделать |
+|---|---|
+| Не открывается с телефона | Устройства должны быть в одной сети. Гостевой Wi-Fi часто изолирует клиентов друг от друга. Проверьте `ufw` и откройте сайт по IP вместо `.local` |
+| В ссылках адрес `172.x.x.x` | Контейнер запущен не в host-сети. Используйте основной `docker-compose.yml` или задайте `FILECOMP_PUBLIC_HOST` |
+| `.local` не открывается | Android и Windows поддерживают mDNS не всегда — используйте IP. На Pi проверьте `systemctl status avahi-daemon` |
+| Контейнер перезапускается, в логе `Permission denied` | Каталог данных не принадлежит `PUID:PGID`: `sudo chown -R $(id -u):$(id -g) data` |
+| Ошибка 413 | Файл больше `FILECOMP_MAX_UPLOAD_BYTES` |
+| Ошибка 507 | Мало места на диске, либо достигнут `FILECOMP_MAX_TRANSFER_BYTES` или `FILECOMP_MAX_TRANSFERS`. Удалите старые передачи или увеличьте лимиты |
+| Сжатие очень медленное | Посмотрите температуру: `vcgencmd measure_temp`. Поставьте охлаждение. Проверьте, что файл не лежит на медленной SD-карте |
+| Pi зависает или не хватает памяти | Уменьшите `FILECOMP_WORKERS` до 1–2 |
+| Скачивание оборвалось с ошибкой | Архив повреждён: SHA-256 не совпал. Посмотрите `docker compose logs` |
 
-Материалы защиты находятся в `docs/coursework/`: сценарий демонстрации, вопросы преподавателя и итоговый отчет. Исходники Mermaid-диаграмм находятся в `docs/diagrams/`.
+---
 
-## Production deployment
+## Ограничения
 
-Production-параметры задаются через переменные окружения; пример находится в `.env.example`. Не коммитьте `.env` и секреты. По умолчанию публичные TCP-сессии отключены (`FILECOMP_ENABLE_SESSIONS=false`), CORS ограничен локальными origins, uploads ограничены 256 MiB, а in-memory transfers ограничены количеством и общим размером.
+- Проект учебный. Шифрования нет. Для работы вне доверенной локальной сети ставьте перед сервисом reverse proxy с TLS и задавайте `FILECOMP_API_KEY`.
+- Алгоритмы написаны на чистом Python и уступают в скорости zstd или gzip.
+- Сервер работает одним процессом. Операции, которые ещё идут во время перезапуска, теряются; готовые передачи сохраняются.
+- TCP relay и GUI ограничены 256 МиБ.
 
-Для production задайте `FILECOMP_STORAGE_DIR` на persistent volume и `FILECOMP_API_KEY` на случайный секрет. При заданном API key все `/api/*`, кроме health, требуют заголовок `X-API-Key`. Встроенный rate limiter ограничивает запросы по IP; для нескольких реплик используйте rate limiting на reverse proxy или Redis.
+## Лицензия
 
-Сборка Docker:
-
-```text
-copy .env.example .env
-docker compose up --build -d
-```
-
-Проверка:
-
-```text
-curl http://localhost:8000/api/health
-```
-
-В production рекомендуется поставить TLS reverse proxy перед приложением, задать явный `FILECOMP_ALLOWED_ORIGINS`, ограничить сетевой доступ к порту и вынести transfer storage в persistent object storage. Текущий storage in-memory подходит для одной демонстрационной реплики: данные исчезают после рестарта.
-
-Upload теперь читается чанками во временный persistent storage, а готовые FCMP-контейнеры сохраняются на диске и восстанавливаются после рестарта. Однако текущие Huffman/LZW/RLE-кодеки всё ещё принимают `bytes` во время самой компрессии; для файлов больше safety limit нужен отдельный streaming codec/container refactor.
-
-CI выполняет Python tests/compile, frontend production build и Docker build через `.github/workflows/ci.yml`.
+Apache License 2.0 — см. `LICENSE`.

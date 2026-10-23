@@ -1,7 +1,7 @@
 import pytest
-import struct
 
 from filecompression.container import pack, unpack
+from filecompression.container.format import HEADER_SIZE
 from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE
 from filecompression.algorithms import get_algorithm
 from filecompression.errors import ContainerError, CorruptDataError
@@ -28,7 +28,7 @@ def test_container_detects_checksum_corruption() -> None:
         unpack(bytes(raw)).decompress()
 
 
-@pytest.mark.parametrize("offset,value", [(0, ord("X")), (4, 2), (5, 99)])
+@pytest.mark.parametrize("offset,value", [(0, ord("X")), (4, 3), (5, 99)])
 def test_container_rejects_invalid_header(offset: int, value: int) -> None:
     raw = bytearray(pack(b"data", "sample.bin", "rle"))
     raw[offset] = value
@@ -46,7 +46,7 @@ def test_container_rejects_truncation_and_trailing_bytes() -> None:
 
 def test_container_rejects_unsafe_decoded_filename() -> None:
     raw = bytearray(pack(b"data", "sample.bin", "rle"))
-    name_start = struct.calcsize(">4sBBHQH32sIQ")
+    name_start = HEADER_SIZE
     raw[name_start:name_start + len("sample.bin")] = b"..\\evilbin"
     with pytest.raises(ContainerError):
         unpack(bytes(raw))

@@ -1,33 +1,54 @@
+# FileComp for a Raspberry Pi (or any Linux box) on the local network.
+#
+#   cp .env.example .env && mkdir -p data && docker compose up -d --build
+#
+# Then open http://<pi-address>:8000 (or http://<hostname>.local:8000) from any device on the LAN.
 services:
   filecompression:
     build: .
+    image: filecompression:latest
+    container_name: filecompression
     restart: unless-stopped
+    init: true
+    # Host networking lets the app see the real LAN interfaces (eth0 / wlan0) instead of a
+    # Docker bridge, so /api/network-info, share links and QR codes carry the LAN address,
+    # and the host's mDNS name (<hostname>.local) points straight at the app.
+    network_mode: host
+    # Run as the owner of the data directory so files on the host stay accessible.
+    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       FILECOMP_WEB_HOST: ${FILECOMP_WEB_HOST:-0.0.0.0}
       FILECOMP_WEB_PORT: ${FILECOMP_WEB_PORT:-8000}
+      FILECOMP_PUBLIC_HOST: ${FILECOMP_PUBLIC_HOST:-}
+      FILECOMP_PUBLIC_URL: ${FILECOMP_PUBLIC_URL:-}
       FILECOMP_LOG_LEVEL: ${FILECOMP_LOG_LEVEL:-INFO}
       FILECOMP_ALLOWED_ORIGINS: ${FILECOMP_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      FILECOMP_MAX_TRANSFERS: ${FILECOMP_MAX_TRANSFERS:-32}
-      FILECOMP_MAX_TRANSFER_BYTES: ${FILECOMP_MAX_TRANSFER_BYTES:-1073741824}
+      FILECOMP_WORKERS: ${FILECOMP_WORKERS:-}
+      FILECOMP_MAX_CONCURRENT_COMPRESSIONS: ${FILECOMP_MAX_CONCURRENT_COMPRESSIONS:-1}
       FILECOMP_MAX_CONCURRENT_UPLOADS: ${FILECOMP_MAX_CONCURRENT_UPLOADS:-2}
-      FILECOMP_MAX_UPLOAD_BYTES: ${FILECOMP_MAX_UPLOAD_BYTES:-268435456}
+      FILECOMP_MAX_UPLOAD_BYTES: ${FILECOMP_MAX_UPLOAD_BYTES:-4294967296}
+      FILECOMP_MAX_TRANSFERS: ${FILECOMP_MAX_TRANSFERS:-32}
+      FILECOMP_MAX_TRANSFER_BYTES: ${FILECOMP_MAX_TRANSFER_BYTES:-17179869184}
+      FILECOMP_MIN_FREE_BYTES: ${FILECOMP_MIN_FREE_BYTES:-536870912}
+      FILECOMP_TRANSFER_TTL_SECONDS: ${FILECOMP_TRANSFER_TTL_SECONDS:-1800}
       FILECOMP_ENABLE_SESSIONS: ${FILECOMP_ENABLE_SESSIONS:-false}
       FILECOMP_TRANSFER_HOST: ${FILECOMP_TRANSFER_HOST:-}
-      FILECOMP_STORAGE_DIR: /var/lib/filecompression
       FILECOMP_API_KEY: ${FILECOMP_API_KEY:-}
       FILECOMP_RATE_LIMIT_WINDOW_SECONDS: ${FILECOMP_RATE_LIMIT_WINDOW_SECONDS:-60}
       FILECOMP_RATE_LIMIT_REQUESTS: ${FILECOMP_RATE_LIMIT_REQUESTS:-120}
-    ports:
-      - "${FILECOMP_WEB_PORT:-8000}:8000"
+    volumes:
+      # Point FILECOMP_DATA_DIR at a USB SSD/HDD for large files (e.g. /mnt/ssd/filecomp);
+      # an SD card is slow and wears out under heavy writes.
+      - ${FILECOMP_DATA_DIR:-./data}:/var/lib/filecompression
     read_only: true
     tmpfs:
-      - /tmp:size=512m,noexec,nosuid
-    volumes:
-      - filecompression-data:/var/lib/filecompression
+      - /tmp:size=64m,noexec,nosuid
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-
-volumes:
-  filecompression-data:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

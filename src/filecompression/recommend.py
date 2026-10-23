@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from filecompression.algorithms import get_algorithm
@@ -38,6 +39,25 @@ def sample(data: bytes) -> bytes:
     chunk = SAMPLE_LIMIT // SAMPLE_CHUNKS
     step = (len(data) - chunk) // (SAMPLE_CHUNKS - 1)
     return b"".join(data[index * step : index * step + chunk] for index in range(SAMPLE_CHUNKS))
+
+
+def sample_file(path: str | os.PathLike) -> bytes:
+    """Same sampling as :func:`sample`, but reads only the sampled ranges from disk."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        if size <= SAMPLE_LIMIT:
+            return handle.read()
+        chunk = SAMPLE_LIMIT // SAMPLE_CHUNKS
+        step = (size - chunk) // (SAMPLE_CHUNKS - 1)
+        parts = []
+        for index in range(SAMPLE_CHUNKS):
+            handle.seek(index * step)
+            parts.append(handle.read(chunk))
+        return b"".join(parts)
+
+
+def recommend_file(path: str | os.PathLike) -> Recommendation:
+    return recommend(sample_file(path))
 
 
 def recommend(data: bytes) -> Recommendation:

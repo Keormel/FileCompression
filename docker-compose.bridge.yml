@@ -1,0 +1,11 @@
+# Override for hosts where host networking is unavailable (Docker Desktop on Windows/macOS):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
+#
+# Inside a bridge network the container cannot see the LAN address, so set
+# FILECOMP_PUBLIC_HOST in .env to the machine's LAN IP (e.g. 192.168.1.15) for share links.
+services:
+  filecompression:
+    network_mode: bridge
+    ports:
+      - "${FILECOMP_WEB_PORT:-8000}:${FILECOMP_WEB_PORT:-8000}"

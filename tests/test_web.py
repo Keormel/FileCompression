@@ -107,3 +107,68 @@ def test_web_recommends_best_algorithm_and_auto_compression_uses_it() -> None:
     download = client.get(f"/api/transfers/{transfer['id']}/download")
     assert download.content == b"hello world " * 500
     assert "filename*=UTF-8''%D0%BE%D1%82%D1%87%D1%91%D1%82.txt" in download.headers["content-disposition"]
+
+
+def _wait_for(client: TestClient, operation_id: str) -> dict:
+    for _ in range(500):
+        status = client.get(f"/api/compress/{operation_id}/status").json()
+        if status["status"] in {"completed", "error", "cancelled"}:
+            return status
+        time.sleep(0.02)
+    raise AssertionError("Compression operation did not finish")
+
+
+def test_web_raw_stream_upload_compresses_multi_block_file() -> None:
+    client = TestClient(app)
+    data = (b"sensor,value\n" + b"42,17.5\n" * 400_000)[:3_000_000]
+    response = client.post("/api/compress/stream", params={"filename": "log.csv", "algorithm": "auto"}, content=data, headers={"Content-Type": "application/octet-stream"})
+    assert response.status_code == 200
+    status = _wait_for(client, response.json()["operationId"])
+    assert status["status"] == "completed", status
+    transfer = client.get(f"/api/transfers/{status['transferId']}").json()
+    assert transfer["original_size"] == len(data)
+    assert transfer["compressed_size"] < len(data)
+    download = client.get(f"/api/transfers/{status['transferId']}/download")
+    assert download.headers["content-length"] == str(len(data))
+    assert download.content == data
+
+
+def test_web_archive_import_then_streamed_restore() -> None:
+    client = TestClient(app)
+    created = client.post("/api/transfers", files={"file": ("notes.txt", b"lorem ipsum " * 2000), "algorithm": (None, "huffman")}).json()
+    archive = client.get(f"/api/transfers/{created['id']}/download?compressed=true").content
+    imported = client.post("/api/archives", params={"filename": "notes.txt.fcmp"}, content=archive)
+    assert imported.status_code == 200
+    assert imported.json()["filename"] == "notes.txt"
+    assert client.get(f"/api/transfers/{imported.json()['id']}/download").content == b"lorem ipsum " * 2000
+    assert client.post("/api/archives", content=b"definitely not an archive" * 10).status_code == 422
+
+
+def test_web_rejects_unsafe_stream_filename() -> None:
+    client = TestClient(app)
+    response = client.post("/api/compress/stream", params={"filename": "../evil.sh"}, content=b"data")
+    assert response.status_code == 400
+
+
+def test_web_network_info_prefers_the_address_the_browser_used(monkeypatch) -> None:
+    monkeypatch.setattr(web_api, "_lan_addresses", lambda: ["192.168.1.40"])
+    client = TestClient(app, base_url="http://192.168.1.40:8000")
+    info = client.get("/api/network-info").json()
+    assert info["url"] == "http://192.168.1.40:8000"
+    assert "http://192.168.1.40:8000" in info["urls"]
+    local = TestClient(app, base_url="http://localhost:8000").get("/api/network-info").json()
+    assert local["url"] == "http://192.168.1.40:8000"
+    monkeypatch.setenv("FILECOMP_PUBLIC_URL", "http://files.lan")
+    assert TestClient(app).get("/api/network-info").json()["url"] == "http://files.lan"
+
+
+def test_web_progress_polling_is_not_rate_limited(monkeypatch) -> None:
+    monkeypatch.setattr(web_api, "RATE_LIMIT_REQUESTS", 3)
+    web_api.rate_limit.clear()
+    client = TestClient(app)
+    for _ in range(10):
+        assert client.get("/api/health").status_code == 200
+    statuses = [client.post("/api/compress/missing/cancel").status_code for _ in range(5)]
+    web_api.rate_limit.clear()
+    assert statuses[:3] == [404, 404, 404]
+    assert 429 in statuses

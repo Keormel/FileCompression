@@ -247,13 +247,15 @@ docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
 1. Включить точку доступа (пароль — не короче 8 символов):
 
    ```bash
-   sudo nmcli device wifi hotspot ifname wlan0 ssid FileComp password 'filecomp123'
+   sudo nmcli device wifi hotspot ifname wlan0 con-name FileComp ssid FileComp password 'filecomp123' && \
+   sudo nmcli connection modify FileComp connection.autoconnect no && \
+   sudo systemd-run --on-active=1h nmcli connection down FileComp
    ```
 
-2. Чтобы точка доступа поднималась сама после перезагрузки:
+2. Чтобы положить точку доступа по ssh:
 
    ```bash
-   sudo nmcli connection modify Hotspot connection.autoconnect yes connection.autoconnect-priority 100
+   sudo nmcli connection down FileComp
    ```
 
 3. Подключите телефон или ноутбук к сети `FileComp` и откройте `http://10.42.0.1:8000`. Это адрес Pi в такой сети по умолчанию. FileComp находит его сам, и ссылки с QR-кодами будут вести на него. Если Pi одновременно подключена к другой сети по Ethernet, задайте адрес явно, чтобы QR-код в шапке не указывал на ту сеть: `FILECOMP_PUBLIC_HOST=10.42.0.1` в `.env`.

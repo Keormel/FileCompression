@@ -5,7 +5,12 @@ from dataclasses import dataclass
 
 from filecompression.algorithms import get_algorithm
 
-CANDIDATES = ("lzw", "huffman", "rle")
+# Fastest codec first: when outputs are within SIZE_TOLERANCE of the smallest, the
+# faster codec wins, because LZW is noticeably slower than RLE and Huffman.
+CANDIDATES = ("rle", "huffman", "lzw")
+SIZE_TOLERANCE = 1.10
+# Below this saving AUTO stores the file as is instead of running a codec over it.
+MIN_SAVING = 0.02
 SAMPLE_LIMIT = 1024 * 1024
 SAMPLE_CHUNKS = 4
 
@@ -18,7 +23,12 @@ class Recommendation:
 
     @property
     def beneficial(self) -> bool:
-        return self.estimates[self.algorithm] < self.sample_size
+        return self.sample_size > 0 and self.estimates[self.algorithm] <= self.sample_size * (1 - MIN_SAVING)
+
+    @property
+    def choice(self) -> str:
+        """Algorithm AUTO mode uses: ``stored`` when no codec shrinks the file noticeably."""
+        return self.algorithm if self.beneficial else "stored"
 
     def as_dict(self) -> dict:
         return {
@@ -61,11 +71,12 @@ def recommend_file(path: str | os.PathLike) -> Recommendation:
 
 
 def recommend(data: bytes) -> Recommendation:
-    """Compress a sample with every codec and pick the one with the smallest output."""
+    """Compress a sample with every codec; pick the fastest one close to the smallest output."""
     probe = sample(data)
     estimates = {}
     for name in CANDIDATES:
         payload, metadata = get_algorithm(name).compress(probe)
         estimates[name] = len(payload) + len(metadata)
-    best = min(CANDIDATES, key=lambda name: estimates[name])
+    smallest = min(estimates.values())
+    best = next(name for name in CANDIDATES if estimates[name] <= smallest * SIZE_TOLERANCE)
     return Recommendation(best, len(probe), estimates)

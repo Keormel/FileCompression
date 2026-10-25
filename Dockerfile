@@ -11,6 +11,16 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
+# The C codec extension is compiled here, so the runtime image needs no compiler.
+FROM python:3.12-slim AS python-build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .
+
 FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -21,9 +31,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FILECOMP_STORAGE_DIR=/var/lib/filecompression \
     FILECOMP_FRONTEND_DIR=/app/frontend/dist
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
-COPY src ./src
-RUN pip install --no-cache-dir ".[web]" \
+COPY --from=python-build /wheels /wheels
+# Fail the build rather than ship an image that silently runs the slow pure Python codecs.
+RUN pip install --no-cache-dir "$(echo /wheels/filecompression-*.whl)[web]" \
+    && python -c "import filecompression._speedups" \
+    && rm -rf /wheels \
     && useradd --create-home --uid 10001 appuser
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 RUN mkdir -p /var/lib/filecompression/tmp && chown -R appuser:appuser /var/lib/filecompression

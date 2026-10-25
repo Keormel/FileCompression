@@ -13,3 +13,5 @@ node_modules/
 !.env.example
 data/
 opencode.json
+*.so
+*.pyd

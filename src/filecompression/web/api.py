@@ -31,9 +31,10 @@ try:
     from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+    from starlette.background import BackgroundTask
 except ImportError:
     FastAPI = File = Form = HTTPException = Query = Request = UploadFile = CORSMiddleware = None
-    FileResponse = JSONResponse = PlainTextResponse = Response = StreamingResponse = None
+    FileResponse = JSONResponse = PlainTextResponse = Response = StreamingResponse = BackgroundTask = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -44,6 +45,7 @@ def _env_int(name: str, default: int) -> int:
 GIB = 1024 ** 3
 AUTO_ALGORITHM = "auto"
 CONTAINER_SUFFIX = ".fcmp"
+ORIGINAL_SUFFIX = ".orig"
 MAX_UPLOAD_SIZE = min(_env_int("FILECOMP_MAX_UPLOAD_BYTES", 4 * GIB), MAX_ORIGINAL_SIZE)
 TRANSFER_TTL_SECONDS = _env_int("FILECOMP_TRANSFER_TTL_SECONDS", 30 * 60)
 MAX_RECOMMEND_SAMPLE = 4 * 1024 * 1024
@@ -52,6 +54,8 @@ MAX_TRANSFER_BYTES = _env_int("FILECOMP_MAX_TRANSFER_BYTES", 16 * GIB)
 MIN_FREE_BYTES = _env_int("FILECOMP_MIN_FREE_BYTES", 512 * 1024 * 1024)
 MAX_CONCURRENT_UPLOADS = _env_int("FILECOMP_MAX_CONCURRENT_UPLOADS", 2)
 MAX_CONCURRENT_COMPRESSIONS = _env_int("FILECOMP_MAX_CONCURRENT_COMPRESSIONS", 2)
+# Keep the uploaded file next to its archive so downloads are served without decompression.
+KEEP_ORIGINAL = os.getenv("FILECOMP_KEEP_ORIGINAL", "true").lower() == "true"
 ENABLE_TRANSFER_SESSIONS = os.getenv("FILECOMP_ENABLE_SESSIONS", "false").lower() == "true"
 TRANSFER_SERVER_HOST = os.getenv("FILECOMP_TRANSFER_HOST", "")
 STORAGE_DIR = Path(os.getenv("FILECOMP_STORAGE_DIR", str(Path.cwd() / "data")))
@@ -75,10 +79,15 @@ class Transfer:
     downloaded: bool = False
     compression_time: float | None = None
     recommended_algorithm: str | None = None
+    original_path: Path | None = None
 
     @property
     def expired(self) -> bool:
         return time.time() - self.created_at > TRANSFER_TTL_SECONDS
+
+    @property
+    def stored_size(self) -> int:
+        return self.info.compressed_size + (self.info.original_size if self.original_path else 0)
 
 
 @dataclass
@@ -125,12 +134,14 @@ def _purge_expired() -> None:
     for identifier, transfer in expired:
         # On POSIX a download that is still streaming keeps its open handle valid.
         transfer.container_path.unlink(missing_ok=True)
+        if transfer.original_path is not None:
+            transfer.original_path.unlink(missing_ok=True)
         logger.info("expired transfer id=%s", identifier)
 
 
 def _stored_bytes() -> int:
     with operation_lock:
-        return sum(item.info.compressed_size for item in transfers.values())
+        return sum(item.stored_size for item in transfers.values())
 
 
 def _free_bytes() -> int:
@@ -143,16 +154,22 @@ def _ensure_disk_space(needed: int) -> None:
         raise HTTPException(507, "Not enough free disk space on the server")
 
 
-def _register_transfer(identifier: str, temporary: Path, info: ContainerInfo, *, compression_time: float | None = None, recommended: str | None = None) -> Transfer:
-    """Move a finished container into place and publish it, enforcing the storage quota."""
+def _register_transfer(identifier: str, temporary: Path, info: ContainerInfo, *, original: Path | None = None, compression_time: float | None = None, recommended: str | None = None) -> Transfer:
+    """Move a finished container (and optionally the original file) into place and publish it, enforcing the storage quota."""
     _purge_expired()
     with operation_lock:
-        if len(transfers) >= MAX_TRANSFERS or _stored_bytes() + info.compressed_size > MAX_TRANSFER_BYTES:
+        stored = _stored_bytes()
+        if len(transfers) >= MAX_TRANSFERS or stored + info.compressed_size > MAX_TRANSFER_BYTES:
             temporary.unlink(missing_ok=True)
             raise HTTPException(507, "Transfer storage limit reached")
         path = STORAGE_DIR / f"{identifier}{CONTAINER_SUFFIX}"
         temporary.replace(path)
-        transfer = Transfer(identifier, path, time.time(), info, compression_time=compression_time, recommended_algorithm=recommended)
+        original_path = None
+        # The original is a convenience: when the quota has no room for it, downloads fall back to decompression.
+        if original is not None and stored + info.compressed_size + info.original_size <= MAX_TRANSFER_BYTES:
+            original_path = STORAGE_DIR / f"{identifier}{ORIGINAL_SUFFIX}"
+            original.replace(original_path)
+        transfer = Transfer(identifier, path, time.time(), info, compression_time=compression_time, recommended_algorithm=recommended, original_path=original_path)
         transfers[identifier] = transfer
     return transfer
 
@@ -179,6 +196,12 @@ def _load_persisted_transfers() -> None:
             path.unlink(missing_ok=True)
             continue
         transfers[path.stem] = Transfer(path.stem, path, path.stat().st_mtime, info)
+    for path in STORAGE_DIR.glob(f"*{ORIGINAL_SUFFIX}"):
+        transfer = transfers.get(path.stem)
+        if transfer is None or path.stat().st_size != transfer.info.original_size:
+            path.unlink(missing_ok=True)
+        else:
+            transfer.original_path = path
 
 
 # ---------------------------------------------------------------- uploads
@@ -253,7 +276,13 @@ def _compress_upload(upload_path: Path, filename: str, algorithm: str, recommend
         with upload_path.open("rb") as source, temporary.open("wb") as destination:
             info = pack_stream(source, destination, filename, algorithm, progress=progress, cancelled=cancelled, executor=parallel.shared_executor())
         compression_time = time.perf_counter() - started
-        return _register_transfer(identifier, temporary, info, compression_time=compression_time, recommended=recommended)
+        original = None
+        if KEEP_ORIGINAL:
+            # Served directly later without a checksum pass, so it must survive a power loss intact.
+            with upload_path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            original = upload_path
+        return _register_transfer(identifier, temporary, info, original=original, compression_time=compression_time, recommended=recommended)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -291,7 +320,7 @@ def _run_compression(operation: CompressionOperation, upload_path: Path) -> None
             if operation.cancel_event.is_set():
                 raise OperationCancelled("Compression cancelled")
             operation.status = "processing"
-        recommended = recommend_file(upload_path).algorithm
+        recommended = recommend_file(upload_path).choice
         algorithm = recommended if operation.algorithm == AUTO_ALGORITHM else operation.algorithm
         with operation_lock:
             operation.recommended_algorithm = recommended
@@ -621,7 +650,7 @@ def create_app():
         algorithm = _validated_algorithm(algorithm)
         upload_path = await _receive_upload(request, _multipart_chunks(file))
         try:
-            recommended = (await asyncio.to_thread(recommend_file, upload_path)).algorithm
+            recommended = (await asyncio.to_thread(recommend_file, upload_path)).choice
             chosen = recommended if algorithm == AUTO_ALGORITHM else algorithm
             transfer = await asyncio.to_thread(_compress_upload, upload_path, filename, chosen, recommended)
         except (CompressionError, ValueError) as error:
@@ -661,6 +690,10 @@ def create_app():
         def mark_downloaded() -> None:
             transfer.downloaded = True
 
+        if transfer.original_path is not None:
+            # The kept upload is the same data the archive's SHA-256 was computed from.
+            headers = {"Content-Disposition": _attachment(info.filename), "X-Checksum": info.checksum}
+            return FileResponse(transfer.original_path, media_type="application/octet-stream", headers=headers, background=BackgroundTask(mark_downloaded))
         headers = {"Content-Disposition": _attachment(info.filename), "Content-Length": str(info.original_size), "X-Checksum": info.checksum}
         return StreamingResponse(_restore_chunks(transfer.container_path, mark_downloaded), media_type="application/octet-stream", headers=headers)
 

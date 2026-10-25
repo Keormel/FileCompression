@@ -16,3 +16,5 @@ data
 docs
 benchmarks
 tests
+*.so
+*.pyd

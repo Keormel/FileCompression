@@ -5,6 +5,7 @@ import sys
 from array import array
 
 from filecompression.errors import CorruptDataError
+from . import _accel
 from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 
@@ -21,6 +22,11 @@ class LzwAlgorithm(CompressionAlgorithm):
     def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         if not data:
             return b"", json.dumps({"code_width": 16}).encode("ascii")
+        if _accel.native is not None:
+            payload = _accel.native.lzw_compress(data)
+            if progress is not None:
+                progress(len(data), len(data))
+            return payload, json.dumps({"code_width": 16}).encode("ascii")
         # A phrase is identified by its code, so "phrase + byte" is the integer key
         # (code << 8 | byte); codes 0-255 are the single-byte phrases.
         dictionary: dict[int, int] = {}
@@ -53,6 +59,11 @@ class LzwAlgorithm(CompressionAlgorithm):
         if not payload:
             return b""
         limit = min(limit, MAX_DECOMPRESSED_SIZE)
+        if _accel.native is not None:
+            try:
+                return _accel.native.lzw_decompress(payload, limit)
+            except ValueError as error:
+                raise CorruptDataError(str(error)) from None
         codes = array("H")
         codes.frombytes(payload)
         if sys.byteorder == "little":

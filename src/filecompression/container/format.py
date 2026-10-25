@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import os
 import struct
 from collections import deque
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO
 
 from filecompression.algorithms import get_algorithm
+from filecompression.algorithms._accel import histogram
 from filecompression.algorithms.base import MAX_DECOMPRESSED_SIZE, ProgressCallback
 from filecompression.errors import ContainerError, CorruptDataError, OperationCancelled
 from filecompression.parallel import pipeline_depth
@@ -47,6 +49,9 @@ _MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 DEFAULT_BLOCK_SIZE = 1024 * 1024
 MAX_BLOCK_SIZE = 64 * 1024 * 1024
 MAX_ORIGINAL_SIZE = 1 << 40
+_PROBE_SIZE = 64 * 1024
+_ENTROPY_STRIDE = 16
+_HIGH_ENTROPY_BITS = 7.5
 CancelCheck = Callable[[], bool]
 
 
@@ -84,9 +89,27 @@ class Container(ContainerInfo):
 # ---------------------------------------------------------------- block codecs
 # Module-level functions so they can run inside the shared process pool.
 
+def _looks_incompressible(algorithm: str, chunk: bytes) -> bool:
+    """Cheap pre-check so already-compressed blocks (JPEG, ZIP, video) skip the full codec run.
+
+    Only blocks whose sampled byte entropy is close to 8 bits are probed: the codec runs
+    on the first 64 KiB, and the block is stored if even that does not shrink.
+    """
+    if len(chunk) <= _PROBE_SIZE:
+        return False
+    sample = chunk[::_ENTROPY_STRIDE]
+    entropy = -sum(count * math.log2(count / len(sample)) for count in histogram(sample) if count) / len(sample)
+    if entropy < _HIGH_ENTROPY_BITS:
+        return False
+    probe = chunk[:_PROBE_SIZE]
+    payload, metadata = get_algorithm(algorithm).compress(probe)
+    # Metadata (the Huffman frequency table) is spread over the whole block in the real run.
+    return len(payload) + len(metadata) * len(probe) // len(chunk) >= len(probe)
+
+
 def _encode_block(algorithm: str, chunk: bytes) -> tuple[int, bytes, bytes | None]:
     """Return (algorithm id, metadata, payload); payload ``None`` means "store the chunk as is"."""
-    if algorithm != "stored":
+    if algorithm != "stored" and not _looks_incompressible(algorithm, chunk):
         payload, metadata = get_algorithm(algorithm).compress(chunk)
         if len(payload) + len(metadata) < len(chunk):
             return _ALGORITHM_IDS[algorithm], metadata, payload

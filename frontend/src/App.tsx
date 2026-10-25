@@ -356,7 +356,7 @@ export default function App() {
           {recommendation && (
             <p className="hint">
               {recommendation.beneficial
-                ? `Recommended: ${recommendation.recommended.toUpperCase()} gives the smallest result on a ${bytes(recommendation.sampleSize)} sample of this file.`
+                ? `Recommended: ${recommendation.recommended.toUpperCase()} gives the best size/speed balance on a ${bytes(recommendation.sampleSize)} sample of this file.`
                 : "This file looks already compressed (e.g. JPG, ZIP, PDF); no algorithm will shrink it noticeably."}
             </p>
           )}

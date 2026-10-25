@@ -4,6 +4,7 @@ import re
 import struct
 
 from filecompression.errors import CorruptDataError
+from . import _accel
 from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 # Only runs of two or more bytes go through the regex loop; bytes between them are
@@ -19,6 +20,11 @@ class RleAlgorithm(CompressionAlgorithm):
     name = "rle"
 
     def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
+        if _accel.native is not None:
+            payload = _accel.native.rle_compress(data)
+            if progress is not None:
+                progress(len(data), len(data))
+            return payload, b""
         output = bytearray()
         pack = _RECORD.pack
         position = 0
@@ -42,6 +48,11 @@ class RleAlgorithm(CompressionAlgorithm):
     def decompress(self, payload: bytes, metadata: bytes, limit: int = MAX_DECOMPRESSED_SIZE) -> bytes:
         if metadata or len(payload) % _RECORD.size:
             raise CorruptDataError("Invalid RLE stream")
+        if _accel.native is not None:
+            try:
+                return _accel.native.rle_decompress(payload, min(limit, MAX_DECOMPRESSED_SIZE))
+            except ValueError as error:
+                raise CorruptDataError(str(error)) from None
         records = list(_RECORD.iter_unpack(payload))
         total = 0
         for count, _ in records:

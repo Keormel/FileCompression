@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import heapq
 import json
-from collections import Counter
+from array import array
 from dataclasses import dataclass
 
 from filecompression.errors import CorruptDataError
+from . import _accel
 from .base import MAX_DECOMPRESSED_SIZE, CompressionAlgorithm, ProgressCallback
 
 
@@ -23,21 +24,29 @@ class HuffmanAlgorithm(CompressionAlgorithm):
     def compress(self, data: bytes, progress: ProgressCallback | None = None) -> tuple[bytes, bytes]:
         if not data:
             return b"", json.dumps({"frequencies": {}, "bit_count": 0}, separators=(",", ":")).encode("ascii")
-        counts = Counter(data)
-        frequencies = [counts.get(symbol, 0) for symbol in range(256)]
+        frequencies = _accel.histogram(data)
 
         root = self._build_tree(frequencies)
         codes: dict[int, str] = {}
         self._build_codes(root, "", codes)
-        # Concatenating per-symbol bit strings and parsing them as one base-2 integer
-        # keeps the per-byte work inside C code (both steps are linear in CPython).
-        table = [""] * 256
-        for symbol, code in codes.items():
-            table[symbol] = code
-        bits = "".join(map(table.__getitem__, data))
-        total_bits = len(bits)
-        padding = -total_bits % 8
-        output = int(bits + "0" * padding, 2).to_bytes((total_bits + padding) // 8, "big")
+        native = _accel.native
+        if native is not None and max(map(len, codes.values())) <= 57:
+            values = array("Q", bytes(8 * 256))
+            lengths = bytearray(256)
+            for symbol, code in codes.items():
+                values[symbol] = int(code, 2)
+                lengths[symbol] = len(code)
+            output, total_bits = native.huffman_encode(data, values, lengths)
+        else:
+            # Concatenating per-symbol bit strings and parsing them as one base-2 integer
+            # keeps the per-byte work inside C code (both steps are linear in CPython).
+            table = [""] * 256
+            for symbol, code in codes.items():
+                table[symbol] = code
+            bits = "".join(map(table.__getitem__, data))
+            total_bits = len(bits)
+            padding = -total_bits % 8
+            output = int(bits + "0" * padding, 2).to_bytes((total_bits + padding) // 8, "big")
         if progress is not None:
             progress(len(data), len(data))
         metadata = json.dumps(
@@ -94,6 +103,14 @@ class HuffmanAlgorithm(CompressionAlgorithm):
                 state_of[id(node)] = len(internal)
                 internal.append(node)
                 pending.extend((node.left, node.right))
+        native = _accel.native
+        if native is not None:
+            # Flattened tree: (left, right) per internal node, a leaf stored as ~symbol.
+            children = array("i", (~child.symbol if child.symbol is not None else state_of[id(child)] for node in internal for child in (node.left, node.right)))
+            try:
+                return native.huffman_decode(payload, bit_count, children, expected_size)
+            except ValueError as error:
+                raise CorruptDataError(str(error)) from None
         transitions: dict[int, tuple[bytes, int]] = {}
 
         def walk(state: int, value: int, bits: int) -> tuple[bytes, int]:

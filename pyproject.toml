@@ -26,6 +26,12 @@ filecompression = "filecompression.cli:main"
 filecompression-server = "filecompression.server_cli:main"
 filecompression-web = "filecompression.web.server:main"
 
+[tool.setuptools]
+# Optional: without a C compiler the build still succeeds and the pure Python codecs are used.
+ext-modules = [
+    { name = "filecompression._speedups", sources = ["src/filecompression/_speedups.c"], optional = true },
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

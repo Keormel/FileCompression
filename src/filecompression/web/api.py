@@ -32,9 +32,10 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
+    from starlette.datastructures import MutableHeaders
 except ImportError:
     FastAPI = File = Form = HTTPException = Query = Request = UploadFile = CORSMiddleware = None
-    FileResponse = JSONResponse = PlainTextResponse = Response = StreamingResponse = BackgroundTask = None
+    FileResponse = JSONResponse = PlainTextResponse = Response = StreamingResponse = BackgroundTask = MutableHeaders = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -220,10 +221,10 @@ async def _write_stream(chunks: AsyncIterator[bytes]) -> Path:
                     raise HTTPException(413, "File exceeds the configured upload limit")
                 buffer += chunk
                 if len(buffer) >= WRITE_BUFFER:
-                    await asyncio.to_thread(handle.write, bytes(buffer))
+                    await asyncio.to_thread(handle.write, buffer)
                     buffer.clear()
             if buffer:
-                await asyncio.to_thread(handle.write, bytes(buffer))
+                await asyncio.to_thread(handle.write, buffer)
         return path
     except BaseException:
         path.unlink(missing_ok=True)
@@ -510,6 +511,55 @@ def network_details(request_hostname: str | None = None, request_origin: str | N
 
 # ---------------------------------------------------------------- application
 
+class GuardsMiddleware:
+    """Rate limit, API key and security headers as plain ASGI middleware.
+
+    @app.middleware("http") would proxy every request body through an extra stream,
+    which roughly halves upload throughput; this passes `receive` through untouched.
+    """
+
+    SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in self.SECURITY_HEADERS.items():
+                    headers.setdefault(name, value)
+            await send(message)
+
+        rejection = self._rejection(Request(scope))
+        if rejection is not None:
+            await rejection(scope, receive, send_with_headers)
+            return
+        await self.app(scope, receive, send_with_headers)
+
+    @staticmethod
+    def _rejection(request: Request) -> Response | None:
+        # Only state-changing requests count, so progress polling during a long compression is never throttled.
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            client = request.client.host if request.client else "unknown"
+            now = time.monotonic()
+            count, window = rate_limit.get(client, (0, now))
+            if now - window >= RATE_LIMIT_WINDOW_SECONDS:
+                count, window = 0, now
+            count += 1
+            rate_limit[client] = (count, window)
+            if count > RATE_LIMIT_REQUESTS:
+                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429, headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)})
+        if API_KEY and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+            if request.headers.get("x-api-key") != API_KEY:
+                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        return None
+
+
 def create_app():
     if FastAPI is None:
         raise RuntimeError("Install web dependencies with: pip install -e '.[web]'")
@@ -541,31 +591,7 @@ def create_app():
 
     _load_persisted_transfers()
 
-    @app.middleware("http")
-    async def security_headers(request, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        return response
-
-    @app.middleware("http")
-    async def production_guards(request, call_next):
-        # Only state-changing requests count, so progress polling during a long compression is never throttled.
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            client = request.client.host if request.client else "unknown"
-            now = time.monotonic()
-            count, window = rate_limit.get(client, (0, now))
-            if now - window >= RATE_LIMIT_WINDOW_SECONDS:
-                count, window = 0, now
-            count += 1
-            rate_limit[client] = (count, window)
-            if count > RATE_LIMIT_REQUESTS:
-                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429, headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)})
-        if API_KEY and request.url.path.startswith("/api/") and request.url.path != "/api/health":
-            if request.headers.get("x-api-key") != API_KEY:
-                return JSONResponse({"detail": "Authentication required"}, status_code=401)
-        return await call_next(request)
+    app.add_middleware(GuardsMiddleware)
 
     frontend_index = Path(os.getenv("FILECOMP_FRONTEND_DIR", str(Path(__file__).resolve().parents[3] / "frontend" / "dist"))) / "index.html"
 

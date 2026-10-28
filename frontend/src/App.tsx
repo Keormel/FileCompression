@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
-import { api } from "./api";
+import { api, gzipForUpload } from "./api";
 import type {
   AlgorithmChoice,
   AlgorithmInfo,
@@ -128,10 +128,25 @@ export default function App() {
     }
     setBusy(true);
     setError("");
-    setStatus("Uploading...");
     try {
-      let current = await api.startCompression(file, algorithm, (loaded, total) =>
-        setUploaded({ loaded, total }),
+      // Already-compressed files (JPG, ZIP, video) gain nothing from gzip, so they are sent as is.
+      let gzipped: Blob | undefined;
+      if (recommendation?.beneficial !== false) {
+        setStatus("Packing for upload...");
+        gzipped = await gzipForUpload(file);
+      }
+      setStatus(
+        gzipped
+          ? `Uploading ${bytes(gzipped.size)} instead of ${bytes(file.size)} (gzip)...`
+          : "Uploading...",
+      );
+      let current = await api.startCompression(
+        file,
+        algorithm,
+        (loaded, total) => setUploaded({ loaded, total }),
+        gzipped,
+        (delay, attempt) =>
+          setStatus(`Server is busy or the connection dropped; retrying in ${delay} s (attempt ${attempt + 1})...`),
       );
       setUploaded(undefined);
       setOperation(current);
@@ -193,8 +208,11 @@ export default function App() {
     setError("");
     setStatus("Uploading archive...");
     try {
-      const imported = await api.importArchive(archive, (loaded, total) =>
-        setUploaded({ loaded, total }),
+      const imported = await api.importArchive(
+        archive,
+        (loaded, total) => setUploaded({ loaded, total }),
+        (delay, attempt) =>
+          setStatus(`Server is busy or the connection dropped; retrying in ${delay} s (attempt ${attempt + 1})...`),
       );
       startDownload(api.downloadUrl(imported.id));
       setStatus(`Restoring ${imported.filename}; SHA-256 is verified while streaming`);
@@ -371,6 +389,7 @@ export default function App() {
               <small>
                 {bytes(uploaded.loaded)} / {bytes(uploaded.total)}
               </small>
+              <small>{status}</small>
             </div>
           )}
           {operation && busy && (
@@ -413,7 +432,9 @@ export default function App() {
                 <span>
                   {operation
                     ? `Compressing ${operation.progress.toFixed(0)}%`
-                    : `Uploading ${uploaded ? ((uploaded.loaded / Math.max(uploaded.total, 1)) * 100).toFixed(0) : 0}%`}
+                    : uploaded
+                      ? `Uploading ${((uploaded.loaded / Math.max(uploaded.total, 1)) * 100).toFixed(0)}%`
+                      : "Preparing upload..."}
                 </span>
                 <span className="compress-button-track">
                   <span

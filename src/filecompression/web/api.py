@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import gzip
+import hashlib
 import ipaddress
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -13,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -33,7 +38,9 @@ try:
     from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
     from starlette.datastructures import MutableHeaders
+    from starlette.requests import ClientDisconnect
 except ImportError:
+    ClientDisconnect = ConnectionError
     FastAPI = File = Form = HTTPException = Query = Request = UploadFile = CORSMiddleware = None
     FileResponse = JSONResponse = PlainTextResponse = Response = StreamingResponse = BackgroundTask = MutableHeaders = None
 
@@ -53,8 +60,20 @@ MAX_RECOMMEND_SAMPLE = 4 * 1024 * 1024
 MAX_TRANSFERS = _env_int("FILECOMP_MAX_TRANSFERS", 32)
 MAX_TRANSFER_BYTES = _env_int("FILECOMP_MAX_TRANSFER_BYTES", 16 * GIB)
 MIN_FREE_BYTES = _env_int("FILECOMP_MIN_FREE_BYTES", 512 * 1024 * 1024)
-MAX_CONCURRENT_UPLOADS = _env_int("FILECOMP_MAX_CONCURRENT_UPLOADS", 2)
+# Uploads arriving over Wi-Fi are network-bound, not disk-bound, so many run side by side;
+# with only two slots everybody else's upload silently stalled until a slow one finished.
+MAX_CONCURRENT_UPLOADS = _env_int("FILECOMP_MAX_CONCURRENT_UPLOADS", 16)
+# Per device, so one phone (or a few stuck ones) cannot occupy every slot.
+MAX_UPLOADS_PER_CLIENT = _env_int("FILECOMP_MAX_UPLOADS_PER_CLIENT", 2)
 MAX_CONCURRENT_COMPRESSIONS = _env_int("FILECOMP_MAX_CONCURRENT_COMPRESSIONS", 2)
+# Uploads in flight plus compressions waiting or running; beyond this new uploads get 503 at once.
+MAX_PENDING_JOBS = _env_int("FILECOMP_MAX_PENDING_JOBS", 32)
+# How long an upload waits for a free slot before the client is told the server is busy.
+UPLOAD_SLOT_WAIT_SECONDS = _env_int("FILECOMP_UPLOAD_SLOT_WAIT_SECONDS", 15)
+# An upload that sends nothing for this long (phone went to sleep, Wi-Fi dropped) is aborted
+# so it stops holding a slot and disk space.
+UPLOAD_IDLE_TIMEOUT_SECONDS = _env_int("FILECOMP_UPLOAD_IDLE_TIMEOUT_SECONDS", 30)
+MAX_CONCURRENT_RECOMMENDATIONS = _env_int("FILECOMP_MAX_CONCURRENT_RECOMMENDATIONS", 2)
 # Keep the uploaded file next to its archive so downloads are served without decompression.
 KEEP_ORIGINAL = os.getenv("FILECOMP_KEEP_ORIGINAL", "true").lower() == "true"
 ENABLE_TRANSFER_SESSIONS = os.getenv("FILECOMP_ENABLE_SESSIONS", "false").lower() == "true"
@@ -63,11 +82,20 @@ STORAGE_DIR = Path(os.getenv("FILECOMP_STORAGE_DIR", str(Path.cwd() / "data")))
 API_KEY = os.getenv("FILECOMP_API_KEY", "")
 RATE_LIMIT_WINDOW_SECONDS = _env_int("FILECOMP_RATE_LIMIT_WINDOW_SECONDS", 60)
 RATE_LIMIT_REQUESTS = _env_int("FILECOMP_RATE_LIMIT_REQUESTS", 120)
+# GET requests (page, polling, downloads) get a separate, much larger budget per client.
+RATE_LIMIT_READ_REQUESTS = _env_int("FILECOMP_RATE_LIMIT_READ_REQUESTS", 1200)
+RATE_LIMIT_MAX_CLIENTS = 4096
 PURGE_INTERVAL_SECONDS = 60
 WRITE_BUFFER = 1024 * 1024
+BUSY_RETRY_AFTER_SECONDS = 10
 logger = logging.getLogger("filecompression.web")
 upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
-rate_limit: dict[str, tuple[int, float]] = {}
+recommend_slots = asyncio.Semaphore(MAX_CONCURRENT_RECOMMENDATIONS)
+rate_limit: dict[tuple[str, str], tuple[int, float]] = {}
+# Bytes promised to uploads and queued compressions that are not transfers yet, keyed by a job token.
+reservations: dict[str, int] = {}
+# Uploads whose body is still arriving, per client address.
+client_uploads: dict[str, int] = {}
 metrics = {"uploads_started": 0, "uploads_completed": 0, "uploads_failed": 0, "uploads_cancelled": 0}
 
 
@@ -107,6 +135,7 @@ class CompressionOperation:
     compression_time: float | None = None
     created_at: float = field(default_factory=time.time)
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    reservation: str | None = None
 
     @property
     def finished(self) -> bool:
@@ -150,9 +179,40 @@ def _free_bytes() -> int:
     return shutil.disk_usage(STORAGE_DIR).free
 
 
-def _ensure_disk_space(needed: int) -> None:
-    if _free_bytes() - needed < MIN_FREE_BYTES:
-        raise HTTPException(507, "Not enough free disk space on the server")
+def _busy(message: str) -> HTTPException:
+    return HTTPException(503, message, headers={"Retry-After": str(BUSY_RETRY_AFTER_SECONDS)})
+
+
+def _reserve(expected: int) -> str:
+    """Admit one more upload job before its body is read, or refuse it while refusing is still cheap.
+
+    Every upload and queued compression holds a reservation until it becomes a transfer or fails,
+    so many users uploading at once cannot overcommit the job queue, the quota or the disk:
+    each check counts what the others have already been promised.
+    """
+    _purge_expired()
+    with operation_lock:
+        if len(reservations) >= MAX_PENDING_JOBS:
+            raise _busy("The server is busy with other uploads; try again in a minute")
+        if len(transfers) + len(reservations) >= MAX_TRANSFERS:
+            raise HTTPException(507, "Transfer storage limit reached; try again when older transfers expire")
+        # The quota counts compressed bytes, unknown until compression ends, so only a quota that is
+        # already full is refused here; the exact check happens when the transfer is registered.
+        if _stored_bytes() >= MAX_TRANSFER_BYTES:
+            raise HTTPException(507, "Transfer storage limit reached; try again when older transfers expire")
+        # The upload itself does occupy the disk, so its full size is held against free space.
+        reserved = sum(reservations.values())
+        if _free_bytes() - reserved - expected < MIN_FREE_BYTES:
+            raise HTTPException(507, "Not enough free disk space on the server")
+        token = uuid.uuid4().hex
+        reservations[token] = expected
+    return token
+
+
+def _release(token: str | None) -> None:
+    if token is not None:
+        with operation_lock:
+            reservations.pop(token, None)
 
 
 def _register_transfer(identifier: str, temporary: Path, info: ContainerInfo, *, original: Path | None = None, compression_time: float | None = None, recommended: str | None = None) -> Transfer:
@@ -207,24 +267,71 @@ def _load_persisted_transfers() -> None:
 
 # ---------------------------------------------------------------- uploads
 
-async def _write_stream(chunks: AsyncIterator[bytes]) -> Path:
+class _UploadWriter:
+    """Writes upload bytes to disk, inflating a gzip-encoded body on the way.
+
+    Runs in a worker thread. Inflated output is produced in WRITE_BUFFER pieces and counted
+    against MAX_UPLOAD_SIZE as it appears, so a gzip bomb is stopped after one extra piece.
+    """
+
+    def __init__(self, handle, gzipped: bool) -> None:
+        self.handle = handle
+        self.decoder = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS) if gzipped else None
+        self.written = 0
+
+    def _emit(self, data: bytes) -> None:
+        self.written += len(data)
+        if self.written > MAX_UPLOAD_SIZE:
+            raise HTTPException(413, "File exceeds the configured upload limit")
+        self.handle.write(data)
+
+    def write(self, data: bytes) -> None:
+        # Checked on every flush, not only up front: concurrent uploads without a declared size
+        # (or with a wrong one) must not be able to fill the disk.
+        if shutil.disk_usage(STORAGE_DIR).free - len(data) < MIN_FREE_BYTES:
+            raise HTTPException(507, "Not enough free disk space on the server")
+        if self.decoder is None:
+            self._emit(data)
+            return
+        try:
+            while data:
+                self._emit(self.decoder.decompress(data, WRITE_BUFFER))
+                data = self.decoder.unconsumed_tail
+        except zlib.error as error:
+            raise HTTPException(400, "Upload is not valid gzip data") from error
+
+    def finish(self) -> None:
+        if self.decoder is None:
+            return
+        try:
+            self._emit(self.decoder.flush())
+        except zlib.error as error:
+            raise HTTPException(400, "Upload is not valid gzip data") from error
+        if not self.decoder.eof:
+            raise HTTPException(400, "Gzip upload is truncated")
+
+
+async def _write_stream(chunks: AsyncIterator[bytes], *, gzipped: bool = False) -> Path:
     """Stream an upload to disk in 1 MiB writes, enforcing the size limit while it arrives."""
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     path = STORAGE_DIR / f"upload-{uuid.uuid4().hex}.tmp"
-    total = 0
+    received = 0
     buffer = bytearray()
     try:
         with path.open("wb") as handle:
+            writer = _UploadWriter(handle, gzipped)
             async for chunk in chunks:
-                total += len(chunk)
-                if total > MAX_UPLOAD_SIZE:
+                received += len(chunk)
+                # The encoded body of a real file is never larger than the file itself.
+                if received > MAX_UPLOAD_SIZE + 64 * 1024:
                     raise HTTPException(413, "File exceeds the configured upload limit")
                 buffer += chunk
                 if len(buffer) >= WRITE_BUFFER:
-                    await asyncio.to_thread(handle.write, buffer)
+                    await asyncio.to_thread(writer.write, bytes(buffer))
                     buffer.clear()
             if buffer:
-                await asyncio.to_thread(handle.write, buffer)
+                await asyncio.to_thread(writer.write, bytes(buffer))
+            await asyncio.to_thread(writer.finish)
         return path
     except BaseException:
         path.unlink(missing_ok=True)
@@ -236,6 +343,19 @@ async def _multipart_chunks(file: UploadFile) -> AsyncIterator[bytes]:
         yield chunk
 
 
+async def _until_idle(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Pass chunks through, aborting when the client stops sending for UPLOAD_IDLE_TIMEOUT_SECONDS."""
+    iterator = aiter(chunks)
+    while True:
+        try:
+            chunk = await asyncio.wait_for(anext(iterator), UPLOAD_IDLE_TIMEOUT_SECONDS)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise HTTPException(408, f"Upload stalled: no data for {UPLOAD_IDLE_TIMEOUT_SECONDS} seconds") from None
+        yield chunk
+
+
 def _declared_length(request: Request) -> int | None:
     try:
         return int(request.headers["content-length"])
@@ -243,14 +363,42 @@ def _declared_length(request: Request) -> int | None:
         return None
 
 
-async def _receive_upload(request: Request, chunks: AsyncIterator[bytes]) -> Path:
+async def _receive_upload(request: Request, chunks: AsyncIterator[bytes], *, expected_size: int | None = None, gzipped: bool = False) -> tuple[Path, str]:
+    """Admit, then store an upload. Returns the file and its reservation, which the caller must release."""
     declared = _declared_length(request)
-    if declared is not None:
-        if declared > MAX_UPLOAD_SIZE + 64 * 1024:
-            raise HTTPException(413, "File exceeds the configured upload limit")
-        _ensure_disk_space(declared)
-    async with upload_slots:
-        return await _write_stream(chunks)
+    if declared is not None and declared > MAX_UPLOAD_SIZE + 64 * 1024:
+        raise HTTPException(413, "File exceeds the configured upload limit")
+    expected = expected_size if expected_size is not None else (declared or 0)
+    if expected > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, "File exceeds the configured upload limit")
+    client = request.client.host if request.client else "unknown"
+    if client_uploads.get(client, 0) >= MAX_UPLOADS_PER_CLIENT:
+        raise HTTPException(429, "This device already has uploads in progress; wait for them to finish", headers={"Retry-After": "10"})
+    token = _reserve(expected)
+    client_uploads[client] = client_uploads.get(client, 0) + 1
+    try:
+        try:
+            await asyncio.wait_for(upload_slots.acquire(), UPLOAD_SLOT_WAIT_SECONDS)
+        except TimeoutError:
+            raise _busy("All upload slots are in use; try again in a minute") from None
+        try:
+            path = await _write_stream(_until_idle(chunks), gzipped=gzipped)
+        except ClientDisconnect:
+            # Routine on Wi-Fi and hotspots; not worth an ERROR traceback in the log.
+            logger.info("upload interrupted: client %s disconnected", client)
+            raise HTTPException(400, "Upload interrupted: the client disconnected") from None
+        finally:
+            upload_slots.release()
+    except BaseException:
+        _release(token)
+        raise
+    finally:
+        remaining = client_uploads.get(client, 1) - 1
+        if remaining > 0:
+            client_uploads[client] = remaining
+        else:
+            client_uploads.pop(client, None)
+    return path, token
 
 
 def _validated_filename(filename: str | None) -> str:
@@ -350,11 +498,15 @@ def _run_compression(operation: CompressionOperation, upload_path: Path) -> None
         metrics["uploads_failed"] += 1
     finally:
         upload_path.unlink(missing_ok=True)
+        _release(operation.reservation)
 
 
-def _start_operation(upload_path: Path, filename: str, algorithm: str) -> dict:
-    operation = CompressionOperation(uuid.uuid4().hex, filename, upload_path.stat().st_size, algorithm)
+def _start_operation(upload_path: Path, filename: str, algorithm: str, reservation: str) -> dict:
+    operation = CompressionOperation(uuid.uuid4().hex, filename, upload_path.stat().st_size, algorithm, reservation=reservation)
     with operation_lock:
+        # The real size replaces the client's estimate until the transfer is registered.
+        if reservation in reservations:
+            reservations[reservation] = operation.total_bytes
         operations[operation.identifier] = operation
     metrics["uploads_started"] += 1
     logger.info("compression queued id=%s filename=%s size=%d algorithm=%s", operation.identifier, filename, operation.total_bytes, algorithm)
@@ -509,6 +661,60 @@ def network_details(request_hostname: str | None = None, request_origin: str | N
     return {"host": host, "port": port, "url": url, "urls": urls, "mdns": mdns}
 
 
+# ---------------------------------------------------------------- frontend
+
+COMPRESSIBLE_SUFFIXES = {".html", ".js", ".css", ".svg", ".json", ".txt", ".map", ".webmanifest"}
+MEDIA_TYPES = {".woff2": "font/woff2", ".woff": "font/woff", ".js": "text/javascript", ".webmanifest": "application/manifest+json"}
+
+
+@dataclass(frozen=True)
+class _StaticFile:
+    body: bytes
+    gzipped: bytes | None
+    media_type: str
+    etag: str
+
+
+class FrontendFiles:
+    """The built frontend, loaded into memory once and pre-gzipped.
+
+    Over a phone hotspot every kilobyte of the first page load counts: the JS bundle shrinks to
+    about a third, hashed /assets files are cached by the browser for a year, and index.html is
+    revalidated with an ETag, so a repeat visit downloads almost nothing.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.files: dict[str, _StaticFile] = {}
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            body = path.read_bytes()
+            suffix = path.suffix.lower()
+            gzipped = gzip.compress(body, compresslevel=9, mtime=0) if suffix in COMPRESSIBLE_SUFFIXES else None
+            if gzipped is not None and len(gzipped) >= len(body):
+                gzipped = None
+            media_type = MEDIA_TYPES.get(suffix) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            if media_type.startswith("text/"):
+                media_type += "; charset=utf-8"
+            etag = '"' + hashlib.sha256(body).hexdigest()[:20] + '"'
+            self.files[path.relative_to(root).as_posix()] = _StaticFile(body, gzipped, media_type, etag)
+
+    def response(self, name: str, request: Request, *, immutable: bool = False) -> Response:
+        item = self.files.get(name)  # a dict lookup, so "../" in a path can never leave the root
+        if item is None:
+            raise HTTPException(404, "Not found")
+        headers = {
+            "ETag": item.etag,
+            "Vary": "Accept-Encoding",
+            "Cache-Control": "public, max-age=31536000, immutable" if immutable else "no-cache",
+        }
+        if request.headers.get("if-none-match") == item.etag:
+            return Response(status_code=304, headers=headers)
+        if item.gzipped is not None and "gzip" in request.headers.get("accept-encoding", "").lower():
+            return Response(item.gzipped, media_type=item.media_type, headers={**headers, "Content-Encoding": "gzip"})
+        return Response(item.body, media_type=item.media_type, headers=headers)
+
+
 # ---------------------------------------------------------------- application
 
 class GuardsMiddleware:
@@ -542,18 +748,34 @@ class GuardsMiddleware:
         await self.app(scope, receive, send_with_headers)
 
     @staticmethod
-    def _rejection(request: Request) -> Response | None:
-        # Only state-changing requests count, so progress polling during a long compression is never throttled.
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            client = request.client.host if request.client else "unknown"
-            now = time.monotonic()
-            count, window = rate_limit.get(client, (0, now))
-            if now - window >= RATE_LIMIT_WINDOW_SECONDS:
-                count, window = 0, now
-            count += 1
-            rate_limit[client] = (count, window)
-            if count > RATE_LIMIT_REQUESTS:
-                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429, headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)})
+    def _over_limit(client: str, bucket: str, limit: int) -> bool:
+        now = time.monotonic()
+        if len(rate_limit) > RATE_LIMIT_MAX_CLIENTS:
+            # Forget finished windows so a stream of new addresses cannot grow memory without bound.
+            for key, (_, started) in list(rate_limit.items()):
+                if now - started >= RATE_LIMIT_WINDOW_SECONDS:
+                    del rate_limit[key]
+        count, window = rate_limit.get((client, bucket), (0, now))
+        if now - window >= RATE_LIMIT_WINDOW_SECONDS:
+            count, window = 0, now
+        count += 1
+        rate_limit[(client, bucket)] = (count, window)
+        return count > limit
+
+    @classmethod
+    def _rejection(cls, request: Request) -> Response | None:
+        client = request.client.host if request.client else "unknown"
+        # Reads get their own, much larger budget, so progress polling during a long compression
+        # is never throttled while a script hammering the server still is.
+        reading = request.method in {"GET", "HEAD", "OPTIONS"}
+        bucket, limit = ("read", RATE_LIMIT_READ_REQUESTS) if reading else ("write", RATE_LIMIT_REQUESTS)
+        if cls._over_limit(client, bucket, limit):
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429, headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)})
+        # Multipart bodies are spooled to disk by the framework before any endpoint code runs,
+        # so an oversized one has to be refused here, from its declared length.
+        declared = _declared_length(request)
+        if declared is not None and declared > MAX_UPLOAD_SIZE + 64 * 1024:
+            return JSONResponse({"detail": "File exceeds the configured upload limit"}, status_code=413)
         if API_KEY and request.url.path.startswith("/api/") and request.url.path != "/api/health":
             if request.headers.get("x-api-key") != API_KEY:
                 return JSONResponse({"detail": "Authentication required"}, status_code=401)
@@ -578,6 +800,9 @@ def create_app():
         logger.info("FileComp is reachable on the local network at: %s", ", ".join(details["urls"]))
         if Path("/.dockerenv").exists() and details["host"].startswith("172."):
             logger.warning("Running inside a bridged Docker network; use network_mode: host or set FILECOMP_PUBLIC_HOST so share links use the LAN address")
+        # Upload writes, disk checks and recommendations all run in the default pool; the stock
+        # size (CPU count + 4, so 8 on a Pi) would make concurrent uploads queue behind each other.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=max(32, MAX_CONCURRENT_UPLOADS * 2 + 8), thread_name_prefix="filecompression-io"))
         task = asyncio.create_task(purge_loop())
         try:
             yield
@@ -634,22 +859,43 @@ def create_app():
         data = await file.read(MAX_RECOMMEND_SAMPLE + 1)
         if len(data) > MAX_RECOMMEND_SAMPLE:
             raise HTTPException(413, "Sample is too large")
-        return (await asyncio.to_thread(recommend, data)).as_dict()
+        # Runs every codec over the sample, so a crowd picking files at once must not take all the CPU.
+        try:
+            await asyncio.wait_for(recommend_slots.acquire(), UPLOAD_SLOT_WAIT_SECONDS)
+        except TimeoutError:
+            raise _busy("The server is busy; try again in a minute") from None
+        try:
+            return (await asyncio.to_thread(recommend, data)).as_dict()
+        finally:
+            recommend_slots.release()
 
     @app.post("/api/compress")
     async def start_compression(request: Request, file: UploadFile = File(...), algorithm: str = Form(AUTO_ALGORITHM)) -> dict:
         filename = _validated_filename(file.filename)
         algorithm = _validated_algorithm(algorithm)
-        upload_path = await _receive_upload(request, _multipart_chunks(file))
-        return _start_operation(upload_path, filename, algorithm)
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        return _start_operation(upload_path, filename, algorithm, reservation)
 
     @app.post("/api/compress/stream")
-    async def start_stream_compression(request: Request, filename: str = Query(...), algorithm: str = Query(AUTO_ALGORITHM)) -> dict:
-        """Raw request body upload: written straight to disk once, without multipart spooling."""
+    async def start_stream_compression(
+        request: Request,
+        filename: str = Query(...),
+        algorithm: str = Query(AUTO_ALGORITHM),
+        size: int | None = Query(None, ge=0),
+        encoding: str = Query("identity"),
+    ) -> dict:
+        """Raw request body upload: written straight to disk once, without multipart spooling.
+
+        ``encoding=gzip`` means the browser gzipped the file to send fewer bytes over a slow
+        network; it is inflated while being written. ``size`` is the original file size, used to
+        refuse an upload that cannot fit before any of it is sent.
+        """
         filename = _validated_filename(filename)
         algorithm = _validated_algorithm(algorithm)
-        upload_path = await _receive_upload(request, request.stream())
-        return _start_operation(upload_path, filename, algorithm)
+        if encoding not in {"identity", "gzip"}:
+            raise HTTPException(400, f"Unsupported upload encoding: {encoding}")
+        upload_path, reservation = await _receive_upload(request, request.stream(), expected_size=size, gzipped=encoding == "gzip")
+        return _start_operation(upload_path, filename, algorithm, reservation)
 
     @app.get("/api/compress/{identifier}/status")
     async def compression_status(identifier: str) -> dict:
@@ -674,21 +920,24 @@ def create_app():
     async def create_transfer(request: Request, file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
         filename = _validated_filename(file.filename)
         algorithm = _validated_algorithm(algorithm)
-        upload_path = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        loop = asyncio.get_running_loop()
         try:
-            recommended = (await asyncio.to_thread(recommend_file, upload_path)).choice
+            # Same bounded pool as background compressions, so this endpoint cannot bypass the CPU limit.
+            recommended = (await loop.run_in_executor(compression_executor, recommend_file, upload_path)).choice
             chosen = recommended if algorithm == AUTO_ALGORITHM else algorithm
-            transfer = await asyncio.to_thread(_compress_upload, upload_path, filename, chosen, recommended)
+            transfer = await loop.run_in_executor(compression_executor, functools.partial(_compress_upload, upload_path, filename, chosen, recommended))
         except (CompressionError, ValueError) as error:
             raise HTTPException(400, str(error)) from error
         finally:
             upload_path.unlink(missing_ok=True)
+            _release(reservation)
         return _metadata(transfer.identifier, transfer)
 
     @app.post("/api/archives")
     async def import_archive(request: Request, filename: str = Query("archive.fcmp")) -> dict:
         """Store an uploaded .fcmp as a transfer so its restored file can be downloaded as a stream."""
-        upload_path = await _receive_upload(request, request.stream())
+        upload_path, reservation = await _receive_upload(request, request.stream())
         try:
             info = await asyncio.to_thread(read_info_path, upload_path)
             identifier = secrets.token_urlsafe(8)
@@ -697,6 +946,7 @@ def create_app():
             raise HTTPException(422, f"Not a valid FCMP archive: {error}") from error
         finally:
             upload_path.unlink(missing_ok=True)
+            _release(reservation)
         logger.info("archive imported id=%s source=%s", transfer.identifier, filename)
         return _metadata(transfer.identifier, transfer)
 
@@ -725,7 +975,9 @@ def create_app():
 
     @app.post("/api/decompress")
     async def decompress_upload(request: Request, file: UploadFile = File(...)) -> Response:
-        upload_path = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        # The archive is deleted once it has been streamed back; nothing is stored for long.
+        _release(reservation)
         try:
             info = await asyncio.to_thread(read_info_path, upload_path)
         except CompressionError as error:
@@ -742,7 +994,7 @@ def create_app():
             return sum(len(chunk) for chunk in _restore_chunks(transfer.container_path))
 
         try:
-            size = await asyncio.to_thread(restored_size)
+            size = await asyncio.get_running_loop().run_in_executor(compression_executor, restored_size)
         except CompressionError as error:
             raise HTTPException(422, str(error)) from error
         return {"verified": True, "checksum": transfer.info.checksum, "size": size}
@@ -781,7 +1033,7 @@ def create_app():
         if client is None:
             raise HTTPException(404, "Session not found")
         filename = _validated_filename(file.filename)
-        upload_path = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
         try:
             from filecompression.container import pack
 
@@ -792,6 +1044,7 @@ def create_app():
             raise HTTPException(502, str(error)) from error
         finally:
             upload_path.unlink(missing_ok=True)
+            _release(reservation)
         return {"status": "sent", "compressed_size": len(container)}
 
     @app.post("/api/sessions/{identifier}/receive")
@@ -809,17 +1062,19 @@ def create_app():
         return Response(container, media_type="application/octet-stream", headers={"Content-Disposition": _attachment(_compressed_name(metadata.filename))})
 
     if frontend_index.exists():
-        from fastapi.staticfiles import StaticFiles
+        frontend = FrontendFiles(frontend_index.parent)
 
-        app.mount("/assets", StaticFiles(directory=frontend_index.parent / "assets"), name="assets")
+        @app.api_route("/assets/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+        async def frontend_asset(path: str, request: Request) -> Response:
+            return frontend.response(f"assets/{path}", request, immutable=True)
 
-        @app.get("/", include_in_schema=False)
-        async def frontend_home() -> FileResponse:
-            return FileResponse(frontend_index)
+        @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+        async def frontend_home(request: Request) -> Response:
+            return frontend.response("index.html", request)
 
-        @app.get("/share/{identifier}", include_in_schema=False)
-        async def frontend_share(identifier: str) -> FileResponse:
-            return FileResponse(frontend_index)
+        @app.api_route("/share/{identifier}", methods=["GET", "HEAD"], include_in_schema=False)
+        async def frontend_share(identifier: str, request: Request) -> Response:
+            return frontend.response("index.html", request)
 
     return app
 

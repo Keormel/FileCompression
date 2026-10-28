@@ -39,6 +39,9 @@ def main() -> None:
         # One process: transfers and operations live in this process's memory.
         workers=1,
         timeout_keep_alive=30,
+        # Beyond this many open connections new requests get an immediate 503 instead of piling up
+        # until the process runs out of memory or file descriptors.
+        limit_concurrency=int(os.getenv("FILECOMP_MAX_CONNECTIONS", "256") or "256"),
         proxy_headers=True,
         forwarded_allow_ips=os.getenv("FILECOMP_FORWARDED_ALLOW_IPS", "127.0.0.1"),
         server_header=False,

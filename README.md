@@ -126,15 +126,15 @@ docker compose up -d
 
 С любого телефона или компьютера в той же сети:
 
-- `http://<IP-адрес Pi>:8000` — например `http://192.168.1.50:8000`;
-- `http://filecomp.local:8000` — по имени хоста. На некоторых Android и Windows имена `.local` не работают, тогда используйте IP.
+- `http://<IP-адрес Pi>` — например `http://192.168.1.50`;
+- `http://filecomp.local` — по имени хоста. На некоторых Android и Windows имена `.local` не работают, тогда используйте IP.
 
 Узнать IP Pi можно командой `hostname -I`, в логе контейнера (`docker compose logs | grep reachable`) или в шапке веб-интерфейса — там есть кнопки «Copy address» и «Show QR».
 
 Проверить, что сервис жив:
 
 ```bash
-curl http://localhost:8000/api/health
+curl http://localhost/api/health
 ```
 
 ---
@@ -151,7 +151,7 @@ curl http://localhost:8000/api/health
 
 **Получить файл:**
 
-1. Откройте ссылку `http://<адрес>:8000/share/<id>`.
+1. Откройте ссылку `http://<адрес>/share/<id>`.
 2. **Download** — исходный файл. Сервер восстанавливает его на лету и сверяет SHA-256. Если данные повреждены, скачивание обрывается и браузер показывает ошибку.
 3. **Download compressed (.fcmp)** — сжатый архив. Скачивание архива можно возобновлять.
 
@@ -173,8 +173,8 @@ curl http://localhost:8000/api/health
 | Запустить | `docker compose up -d` |
 | Перезапустить после правки `.env` | `docker compose up -d` |
 | Обновить до новой версии | `git pull && docker compose up -d --build` |
-| Состояние и свободное место | `curl localhost:8000/api/health` |
-| Метрики (формат Prometheus) | `curl localhost:8000/metrics` |
+| Состояние и свободное место | `curl localhost/api/health` |
+| Метрики (формат Prometheus) | `curl localhost/metrics` |
 | Удалить все передачи | `docker compose down && rm -f data/*.fcmp && docker compose up -d` |
 
 Контейнер запускается вместе с Pi автоматически (`restart: unless-stopped`).
@@ -189,7 +189,7 @@ curl http://localhost:8000/api/health
 |---|---|---|
 | `PUID`, `PGID` | `1000` | От какого пользователя работает контейнер. Он должен владеть каталогом данных |
 | `FILECOMP_DATA_DIR` | `./data` | Где на хосте хранятся файлы |
-| `FILECOMP_WEB_PORT` | `8000` | Порт веб-интерфейса |
+| `FILECOMP_WEB_PORT` | `80` (без Docker — `8000`) | Порт веб-интерфейса. На порту 80 адрес открывается без номера порта: `http://10.42.0.1` |
 | `FILECOMP_PUBLIC_HOST` | — | Явно заданный LAN-адрес для ссылок, например `192.168.1.50` |
 | `FILECOMP_PUBLIC_URL` | — | Полный адрес для ссылок, например `http://files.lan` (используется за reverse proxy) |
 | `FILECOMP_WORKERS` | число ядер | Сколько процессов сжимают блоки параллельно |
@@ -223,7 +223,7 @@ curl http://localhost:8000/api/health
 Контейнер запускается с `network_mode: host` и использует сеть Raspberry Pi напрямую:
 
 - приложение видит реальные интерфейсы `eth0` и `wlan0`, поэтому ссылки и QR-коды содержат LAN-адрес Pi, а не внутренний адрес Docker (`172.17.x.x`);
-- пробрасывать порты не нужно — сервис сразу слушает порт `8000` на Pi;
+- пробрасывать порты не нужно — сервис сразу слушает порт `80` на Pi, поэтому в адресе порт указывать не нужно;
 - имя `<hostname>.local` работает через avahi, который в Raspberry Pi OS включён по умолчанию.
 
 Адрес для ссылок выбирается в таком порядке:
@@ -241,7 +241,7 @@ curl http://localhost:8000/api/health
 docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
 ```
 
-**Брандмауэр.** Если на Pi включён `ufw`, откройте порт: `sudo ufw allow 8000/tcp`.
+**Брандмауэр.** Если на Pi включён `ufw`, откройте порт: `sudo ufw allow 80/tcp`.
 
 ### Pi как точка доступа Wi-Fi (без роутера и интернета)
 
@@ -263,7 +263,7 @@ docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
    sudo nmcli connection down FileComp
    ```
 
-3. Подключите телефон или ноутбук к сети `FileComp` и откройте `http://10.42.0.1:8000`. Это адрес Pi в такой сети по умолчанию. FileComp находит его сам, и ссылки с QR-кодами будут вести на него. Если Pi одновременно подключена к другой сети по Ethernet, задайте адрес явно, чтобы QR-код в шапке не указывал на ту сеть: `FILECOMP_PUBLIC_HOST=10.42.0.1` в `.env`.
+3. Подключите телефон или ноутбук к сети `FileComp` и откройте `http://10.42.0.1`. Это адрес Pi в такой сети по умолчанию. FileComp находит его сам, и ссылки с QR-кодами будут вести на него. Если Pi одновременно подключена к другой сети по Ethernet, задайте адрес явно, чтобы QR-код в шапке не указывал на ту сеть: `FILECOMP_PUBLIC_HOST=10.42.0.1` в `.env`.
 
 Телефон может написать «Нет подключения к интернету». Выберите «Оставаться на связи», а если страница всё равно не открывается, отключите мобильные данные: иначе Android может отправлять запросы через сотовую сеть.
 
@@ -296,7 +296,7 @@ sudo nmcli connection delete FileComp    # удалить совсем
    ```bash
    docker compose up -d --build
    ```
-3. Откройте `http://10.42.0.1:8000/admin/hotspot` с устройства в сети `FileComp` или `http://192.168.7.2:8000/admin/hotspot` по USB. Ссылки на панель в основном интерфейсе нет. Войдите с паролем из `.env`.
+3. Откройте `http://10.42.0.1/admin/hotspot` с устройства в сети `FileComp` или `http://192.168.7.2/admin/hotspot` по USB. Ссылки на панель в основном интерфейсе нет. Войдите с паролем из `.env`.
 
 **Как это работает.** Раз в 3 секунды сервер читает `iw dev wlan0 station dump` и сравнивает список с предыдущим. IP и имя устройства берутся из файла аренд dnsmasq (`/var/lib/NetworkManager/dnsmasq-wlan0.leases`, путь меняется через `FILECOMP_HOTSPOT_LEASES`). «Отключить» сначала пробует `wpa_cli deauthenticate`, а если не вышло — `iw station del`. «Заблокировать» добавляет MAC в nftables (таблица `inet filecomp_hotspot`, правило `iifname wlan0 ether saddr @blocked drop`) и сразу отключает устройство. После перезагрузки Pi блок-лист восстанавливается в nftables при старте FileComp.
 
@@ -326,7 +326,7 @@ sudo nmcli connection delete FileComp    # удалить совсем
 
 - Страница грузится без интернета: шрифты лежат в бандле, а не на Google Fonts. JS и CSS отдаются в gzip (примерно втрое меньше), а файлы из `/assets` браузер кэширует на год. При повторном открытии почти ничего не скачивается.
 - Текстовые и другие сжимаемые файлы (до 256 МиБ) браузер перед отправкой упаковывает в gzip, а сервер распаковывает их на лету. Например, лог на 7 МБ уходит как 1,2 МБ, то есть по медленной сети в несколько раз быстрее. Уже сжатые файлы (JPG, ZIP, видео) отправляются как есть.
-- Открывайте адрес по IP (`http://10.42.0.1:8000`), а не по `*.local`: Android часто не умеет mDNS, и тогда ждёт, пока имя не разрешится.
+- Открывайте адрес по IP (`http://10.42.0.1`), а не по `*.local`: Android часто не умеет mDNS, и тогда ждёт, пока имя не разрешится.
 
 ### Много пользователей одновременно
 
@@ -418,7 +418,7 @@ Relay и GUI передают контейнер целиком в памяти,
 
 ## HTTP API
 
-Интерактивная документация доступна на запущенном сервере: `http://<адрес>:8000/docs`.
+Интерактивная документация доступна на запущенном сервере: `http://<адрес>/docs`.
 
 | Метод и путь | Назначение |
 |---|---|
@@ -445,13 +445,13 @@ Relay и GUI передают контейнер целиком в памяти,
 ```bash
 # загрузить и сжать
 curl -X POST --data-binary @video.mov \
-  "http://filecomp.local:8000/api/compress/stream?filename=video.mov&algorithm=auto"
+  "http://filecomp.local/api/compress/stream?filename=video.mov&algorithm=auto"
 # → {"operationId": "...", ...}
 
-curl http://filecomp.local:8000/api/compress/<operationId>/status
+curl http://filecomp.local/api/compress/<operationId>/status
 # → {"status": "completed", "transferId": "...", ...}
 
-curl -OJ http://filecomp.local:8000/api/transfers/<transferId>/download
+curl -OJ http://filecomp.local/api/transfers/<transferId>/download
 ```
 
 ---
@@ -524,6 +524,7 @@ tests/, benchmarks/, docs/
 | В ссылках адрес `172.x.x.x` | Контейнер запущен не в host-сети. Используйте основной `docker-compose.yml` или задайте `FILECOMP_PUBLIC_HOST` |
 | `.local` не открывается | Android и Windows поддерживают mDNS не всегда — используйте IP. На Pi проверьте `systemctl status avahi-daemon` |
 | Контейнер перезапускается, в логе `Permission denied` | Каталог данных не принадлежит `PUID:PGID`: `sudo chown -R $(id -u):$(id -g) data` |
+| Контейнер не стартует, в логе `address already in use` | Порт 80 на Pi занят другим веб-сервером (`sudo ss -ltnp 'sport = :80'` покажет, каким). Остановите его или задайте `FILECOMP_WEB_PORT=8000` в `.env`; тогда адрес будет `http://<адрес>:8000` |
 | Ошибка 413 | Файл больше `FILECOMP_MAX_UPLOAD_BYTES` |
 | «Server is busy», ошибка 503 | Сервер загружен. Страница повторяет попытку сама. Если такое бывает часто, увеличьте `FILECOMP_MAX_PENDING_JOBS` и `FILECOMP_MAX_CONCURRENT_UPLOADS` |
 | Ошибка 429 | С этого устройства уже идут `FILECOMP_MAX_UPLOADS_PER_CLIENT` загрузки, либо превышен rate limit |

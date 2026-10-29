@@ -2,7 +2,7 @@
 #
 #   cp .env.example .env && mkdir -p data && docker compose up -d --build
 #
-# Then open http://<pi-address>:8000 (or http://<hostname>.local:8000) from any device on the LAN.
+# Then open http://<pi-address> (or http://<hostname>.local) from any device on the LAN.
 services:
   filecompression:
     build: .
@@ -18,7 +18,9 @@ services:
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       FILECOMP_WEB_HOST: ${FILECOMP_WEB_HOST:-0.0.0.0}
-      FILECOMP_WEB_PORT: ${FILECOMP_WEB_PORT:-8000}
+      # 80 is the standard HTTP port, so addresses work without ":8000". If something else on the
+      # host already uses port 80, set FILECOMP_WEB_PORT=8000 in .env.
+      FILECOMP_WEB_PORT: ${FILECOMP_WEB_PORT:-80}
       FILECOMP_PUBLIC_HOST: ${FILECOMP_PUBLIC_HOST:-}
       FILECOMP_PUBLIC_URL: ${FILECOMP_PUBLIC_URL:-}
       FILECOMP_LOG_LEVEL: ${FILECOMP_LOG_LEVEL:-INFO}
@@ -59,14 +61,16 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,noexec,nosuid
-    # No no-new-privileges here: the app runs as a non-root user and gets NET_ADMIN only through
-    # the file capability set on iw and nft in the image, which that option would block.
+    # No no-new-privileges here: the app runs as a non-root user and gets its two capabilities
+    # only through the file capabilities set in the image, which that option would block.
     cap_drop:
       - ALL
     # Hotspot admin panel: kick (iw station del) and block (nftables) on the host network.
     # Only iw and nft can use it; the panel stays off until FILECOMP_HOTSPOT_ADMIN_PASSWORD is set.
     cap_add:
       - NET_ADMIN
+      # Listen on port 80 as a non-root user (only python has this file capability).
+      - NET_BIND_SERVICE
     logging:
       driver: json-file
       options:

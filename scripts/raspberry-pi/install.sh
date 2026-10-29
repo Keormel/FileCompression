@@ -40,7 +40,10 @@ echo "==> Building and starting the container (the first build on a Pi takes a f
 $DOCKER compose up -d --build
 
 PORT=$(grep -E '^FILECOMP_WEB_PORT=' .env | cut -d= -f2-)
-PORT=${PORT:-8000}
+PORT=${PORT:-80}
+# Port 80 is the default for http://, so it is left out of the printed addresses.
+SUFFIX=":${PORT}"
+[ "$PORT" = 80 ] && SUFFIX=""
 echo "==> Waiting for the service"
 for _ in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
@@ -55,10 +58,10 @@ for address in $(hostname -I); do
     case "$address" in
         *:*) ;;                       # skip IPv6
         172.17.*|172.18.*) ;;         # skip Docker bridges
-        *) echo "    http://${address}:${PORT}" ;;
+        *) echo "    http://${address}${SUFFIX}" ;;
     esac
 done
-echo "    http://$(hostname).local:${PORT}   (mDNS, if avahi-daemon is running)"
+echo "    http://$(hostname).local${SUFFIX}   (mDNS, if avahi-daemon is running)"
 echo
 echo "Logs:    $DOCKER compose logs -f"
 echo "Stop:    $DOCKER compose down"

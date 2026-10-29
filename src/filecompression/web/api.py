@@ -670,24 +670,29 @@ def _is_routable_literal(host: str | None) -> bool:
     return not (address.is_loopback or address.is_unspecified)
 
 
+def _origin(host: str, port: int) -> str:
+    # On the standard port the link needs no ":80", so people can type just the address.
+    return f"http://{host}" if port == 80 else f"http://{host}:{port}"
+
+
 def network_details(request_hostname: str | None = None, request_origin: str | None = None) -> dict:
     port = _env_int("FILECOMP_PUBLIC_PORT", _env_int("FILECOMP_WEB_PORT", 8000))
     addresses = _lan_addresses()
-    urls = [f"http://{address}:{port}" for address in addresses]
+    urls = [_origin(address, port) for address in addresses]
     mdns = _mdns_hostname()
     if mdns:
-        urls.append(f"http://{mdns}:{port}")
+        urls.append(_origin(mdns, port))
     public_url = os.getenv("FILECOMP_PUBLIC_URL", "").strip().rstrip("/")
     public_host = os.getenv("FILECOMP_PUBLIC_HOST", "").strip()
     if public_url:
         url = public_url
     elif public_host:
-        url = f"http://{public_host}:{port}"
+        url = _origin(public_host, port)
     elif request_origin and _is_routable_literal(request_hostname):
         # The browser already reached the server at this IP address, so other LAN devices can too.
         url = request_origin
     else:
-        url = urls[0] if urls else f"http://127.0.0.1:{port}"
+        url = urls[0] if urls else _origin("127.0.0.1", port)
     host = url.split("://", 1)[-1].rsplit(":", 1)[0]
     if url not in urls:
         urls.insert(0, url)

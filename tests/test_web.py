@@ -172,3 +172,14 @@ def test_web_progress_polling_is_not_rate_limited(monkeypatch) -> None:
     web_api.rate_limit.clear()
     assert statuses[:3] == [404, 404, 404]
     assert 429 in statuses
+
+
+def test_web_network_info_leaves_out_the_standard_port(monkeypatch) -> None:
+    monkeypatch.setattr(web_api, "_lan_addresses", lambda: ["10.42.0.1"])
+    monkeypatch.setattr(web_api, "_mdns_hostname", lambda: "filecomp.local")
+    monkeypatch.setenv("FILECOMP_WEB_PORT", "80")
+    info = TestClient(app, base_url="http://localhost").get("/api/network-info").json()
+    assert info["url"] == "http://10.42.0.1"
+    assert info["urls"] == ["http://10.42.0.1", "http://filecomp.local"]
+    monkeypatch.setenv("FILECOMP_PUBLIC_HOST", "10.42.0.1")
+    assert TestClient(app).get("/api/network-info").json()["url"] == "http://10.42.0.1"

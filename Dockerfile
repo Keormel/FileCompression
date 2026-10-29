@@ -26,15 +26,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HOME=/tmp \
     FILECOMP_WEB_HOST=0.0.0.0 \
-    FILECOMP_WEB_PORT=8000 \
+    FILECOMP_WEB_PORT=80 \
     FILECOMP_STORAGE_DIR=/var/lib/filecompression \
     FILECOMP_FRONTEND_DIR=/app/frontend/dist
 WORKDIR /app
-# Tools for the hotspot admin panel. iw and nft get the NET_ADMIN file capability so the non-root
-# app user can kick and block devices; it only takes effect when the container is granted
-# NET_ADMIN (docker-compose.yml does) and is inert otherwise.
+# File capabilities let the non-root app user do two privileged things; each only takes effect
+# when the container is granted the capability (docker-compose.yml does) and is inert otherwise:
+# - python may listen on port 80, so the site opens without ":8000" in the address;
+# - iw and nft may kick and block devices for the hotspot admin panel (NET_ADMIN).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iw nftables wpasupplicant libcap2-bin \
+    && setcap cap_net_bind_service+ep "$(readlink -f "$(command -v python3)")" \
     && setcap cap_net_admin+ep "$(command -v iw)" \
     && setcap cap_net_admin+ep "$(command -v nft)" \
     && rm -rf /var/lib/apt/lists/*
@@ -47,8 +49,8 @@ RUN pip install --no-cache-dir "$(echo /wheels/filecompression-*.whl)[web]" \
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 RUN mkdir -p /var/lib/filecompression/tmp && chown -R appuser:appuser /var/lib/filecompression
 USER appuser
-EXPOSE 8000
+EXPOSE 80
 VOLUME ["/var/lib/filecompression"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.getenv('FILECOMP_WEB_PORT', '8000'), timeout=5)"]
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.getenv('FILECOMP_WEB_PORT', '80'), timeout=5)"]
 CMD ["python", "-m", "filecompression.web.server"]

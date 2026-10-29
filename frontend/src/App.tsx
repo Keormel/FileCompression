@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { api, gzipForUpload } from "./api";
 import type {
@@ -76,6 +76,7 @@ export default function App() {
   const [qr, setQr] = useState("");
   const [shareQr, setShareQr] = useState("");
   const [verified, setVerified] = useState(false);
+  const readyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     Promise.all([api.algorithms(), api.networkInfo()])
@@ -92,6 +93,10 @@ export default function App() {
         .then(setTransfer)
         .catch(() => setError("Transfer not found."));
   }, []);
+  // On a phone the result panel sits far below the button, so bring the download offer into view.
+  useEffect(() => {
+    if (transfer && !busy) readyRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [transfer, busy]);
   const selectedInfo = useMemo(
     () => algorithms.find((item) => item.id === algorithm),
     [algorithms, algorithm],
@@ -449,6 +454,24 @@ export default function App() {
               "Compress and create transfer"
             )}
           </button>
+          {transfer && !busy && (
+            <div className="ready-download" ref={readyRef} aria-live="polite">
+              <span className="eyebrow">ARCHIVE READY</span>
+              <b>{transfer.filename}.fcmp</b>
+              <small>
+                {bytes(transfer.original_size)} → {bytes(transfer.compressed_size)}
+                {transfer.algorithm === "stored"
+                  ? "; this file does not compress, the archive is about the same size"
+                  : `; ${transfer.space_saving.toFixed(1)}% saved with ${transfer.algorithm.toUpperCase()}`}
+              </small>
+              <button className="primary full" onClick={() => download(transfer.id, true)}>
+                Download compressed (.fcmp)
+              </button>
+              <button className="text-button" onClick={() => download(transfer.id)}>
+                or download the original {transfer.filename}
+              </button>
+            </div>
+          )}
           {error && <p className="error">{error}</p>}
         </div>
         <aside>

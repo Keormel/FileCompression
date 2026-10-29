@@ -43,6 +43,11 @@ services:
       FILECOMP_RATE_LIMIT_WINDOW_SECONDS: ${FILECOMP_RATE_LIMIT_WINDOW_SECONDS:-60}
       FILECOMP_RATE_LIMIT_REQUESTS: ${FILECOMP_RATE_LIMIT_REQUESTS:-120}
       FILECOMP_RATE_LIMIT_READ_REQUESTS: ${FILECOMP_RATE_LIMIT_READ_REQUESTS:-1200}
+      # Hotspot admin panel (/admin/hotspot); off while the password is empty.
+      # Kicking and blocking also need docker-compose.hotspot.yml.
+      FILECOMP_HOTSPOT_ADMIN_PASSWORD: ${FILECOMP_HOTSPOT_ADMIN_PASSWORD:-}
+      FILECOMP_HOTSPOT_IFACE: ${FILECOMP_HOTSPOT_IFACE:-wlan0}
+      FILECOMP_HOTSPOT_LEASES: ${FILECOMP_HOTSPOT_LEASES:-}
     volumes:
       # Point FILECOMP_DATA_DIR at a USB SSD/HDD for large files (e.g. /mnt/ssd/filecomp);
       # an SD card is slow and wears out under heavy writes.

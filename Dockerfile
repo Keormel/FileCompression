@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Multi-arch image: linux/amd64, linux/arm64 (Raspberry Pi 3/4/5 with 64-bit OS)
 # and linux/arm/v7 (32-bit Raspberry Pi OS).
 
@@ -31,6 +30,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FILECOMP_STORAGE_DIR=/var/lib/filecompression \
     FILECOMP_FRONTEND_DIR=/app/frontend/dist
 WORKDIR /app
+# Tools for the hotspot admin panel. iw and nft get the NET_ADMIN file capability so the non-root
+# app user can kick and block devices; it only takes effect when the container is granted
+# NET_ADMIN (docker-compose.hotspot.yml) and is inert otherwise.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iw nftables wpasupplicant libcap2-bin \
+    && setcap cap_net_admin+ep "$(command -v iw)" \
+    && setcap cap_net_admin+ep "$(command -v nft)" \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=python-build /wheels /wheels
 # Fail the build rather than ship an image that silently runs the slow pure Python codecs.
 RUN pip install --no-cache-dir "$(echo /wheels/filecompression-*.whl)[web]" \

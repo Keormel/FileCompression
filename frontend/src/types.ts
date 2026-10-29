@@ -49,3 +49,33 @@ export type NetworkInfo = {
   mdns: string | null
   maxUploadBytes: number
 }
+
+export type HotspotClient = {
+  mac: string
+  ip: string | null
+  hostname: string | null
+  label: string | null
+  signal: number | null
+  connectedSeconds: number
+  connectedAt: number
+  rxBytes: number
+  txBytes: number
+  blocked: boolean
+}
+
+export type HotspotClients = { interface: string; clients: HotspotClient[]; error: string | null; updatedAt: number | null }
+
+export type HotspotEvent = {
+  id: number
+  at: number
+  kind: 'CONNECTED' | 'DISCONNECTED'
+  mac: string
+  ip: string | null
+  hostname: string | null
+  label: string | null
+  duration: number | null
+  rxBytes: number | null
+  txBytes: number | null
+}
+
+export type HotspotBlocked = { mac: string; blockedAt: number; label: string | null }

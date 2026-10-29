@@ -785,6 +785,9 @@ class GuardsMiddleware:
 def create_app():
     if FastAPI is None:
         raise RuntimeError("Install web dependencies with: pip install -e '.[web]'")
+    from filecompression.web import hotspot
+
+    hotspot.storage_dir = STORAGE_DIR
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -804,19 +807,22 @@ def create_app():
         # size (CPU count + 4, so 8 on a Pi) would make concurrent uploads queue behind each other.
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=max(32, MAX_CONCURRENT_UPLOADS * 2 + 8), thread_name_prefix="filecompression-io"))
         task = asyncio.create_task(purge_loop())
+        hotspot_task = await hotspot.start()
         try:
             yield
         finally:
             task.cancel()
+            await hotspot.stop(hotspot_task)
             parallel.shutdown()
 
     app = FastAPI(title="FileComp API", version="2.0", lifespan=lifespan)
     allowed_origins = [item.strip() for item in os.getenv("FILECOMP_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()]
-    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type", "X-API-Key"], expose_headers=["Content-Disposition", "X-Checksum"], max_age=600)
+    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type", "X-API-Key", "Authorization"], expose_headers=["Content-Disposition", "X-Checksum"], max_age=600)
 
     _load_persisted_transfers()
 
     app.add_middleware(GuardsMiddleware)
+    app.include_router(hotspot.router)
 
     frontend_index = Path(os.getenv("FILECOMP_FRONTEND_DIR", str(Path(__file__).resolve().parents[3] / "frontend" / "dist"))) / "index.html"
 
@@ -1074,6 +1080,13 @@ def create_app():
 
         @app.api_route("/share/{identifier}", methods=["GET", "HEAD"], include_in_schema=False)
         async def frontend_share(identifier: str, request: Request) -> Response:
+            return frontend.response("index.html", request)
+
+        @app.api_route("/admin/hotspot", methods=["GET", "HEAD"], include_in_schema=False)
+        async def frontend_hotspot_admin(request: Request) -> Response:
+            # Not linked from the main page, and absent altogether while the panel is disabled.
+            if not hotspot.enabled():
+                raise HTTPException(404, "Not found")
             return frontend.response("index.html", request)
 
     return app

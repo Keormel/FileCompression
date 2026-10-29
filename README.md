@@ -194,7 +194,7 @@ curl http://localhost:8000/api/health
 | `FILECOMP_PUBLIC_URL` | — | Полный адрес для ссылок, например `http://files.lan` (используется за reverse proxy) |
 | `FILECOMP_WORKERS` | число ядер | Сколько процессов сжимают блоки параллельно |
 | `FILECOMP_MAX_CONCURRENT_COMPRESSIONS` | `1` | Сколько файлов сжимается одновременно; остальные ждут в очереди |
-| `FILECOMP_MAX_CONCURRENT_UPLOADS` | `2` | Сколько загрузок принимается одновременно |
+| `FILECOMP_MAX_CONCURRENT_UPLOADS` | `16` | Сколько загрузок принимается одновременно |
 | `FILECOMP_MAX_UPLOAD_BYTES` | `4294967296` (4 ГиБ) | Максимальный размер одного файла |
 | `FILECOMP_MAX_TRANSFER_BYTES` | `17179869184` (16 ГиБ) | Общий объём хранимых архивов и сохранённых оригиналов |
 | `FILECOMP_MAX_TRANSFERS` | `32` | Максимальное число хранимых передач |
@@ -206,6 +206,9 @@ curl http://localhost:8000/api/health
 | `FILECOMP_RATE_LIMIT_REQUESTS` / `_WINDOW_SECONDS` | `120` / `60` | Ограничение POST/DELETE-запросов с одного IP. Опрос прогресса не ограничивается |
 | `FILECOMP_ALLOWED_ORIGINS` | localhost:5173 | CORS. Нужен только для dev-сервера фронтенда |
 | `FILECOMP_ENABLE_SESSIONS`, `FILECOMP_TRANSFER_HOST` | `false` | Доступ к TCP relay из веб-API. Держите выключенным |
+| `FILECOMP_HOTSPOT_ADMIN_PASSWORD` | — | Включает [админ-панель точки доступа](#админ-панель-точки-доступа) |
+| `FILECOMP_HOTSPOT_IFACE` | `wlan0` | Wi-Fi-интерфейс точки доступа |
+| `FILECOMP_HOTSPOT_LEASES` | `/var/lib/NetworkManager/dnsmasq-<iface>.leases` | Файл аренд DHCP с IP и именами устройств |
 
 Типовые настройки:
 
@@ -267,9 +270,42 @@ docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --build
 Вернуть Pi к обычному Wi-Fi:
 
 ```bash
-sudo nmcli connection down Hotspot      # выключить до перезагрузки
-sudo nmcli connection delete Hotspot    # удалить совсем
+sudo nmcli connection down FileComp      # выключить до перезагрузки
+sudo nmcli connection delete FileComp    # удалить совсем
 ```
+
+### Админ-панель точки доступа
+
+Если Pi раздаёт Wi-Fi (подключение `FileComp` выше), FileComp может вести журнал подключений к точке доступа и управлять устройствами. Страница `/admin/hotspot` показывает:
+
+- кто подключён сейчас: имя, MAC, IP, сигнал, время подключения, трафик. Таблица обновляется каждые 5 секунд, у каждого устройства есть кнопки «Отключить» и «Заблокировать»;
+- блок-лист с кнопкой «Разблокировать»;
+- журнал подключений и отключений, при отключении — с длительностью сессии и трафиком. Записи можно удалять по одной или очистить журнал целиком.
+
+Любому MAC можно дать понятную метку («телефон Саши»), и она показывается везде вместо имени устройства. Журнал, метки и блок-лист хранятся в `hotspot.sqlite3` в каталоге данных и переживают перезапуск.
+
+**Как включить.**
+
+1. Задайте пароль в `.env`: `FILECOMP_HOTSPOT_ADMIN_PASSWORD=...`. Без пароля панель и её API отвечают 404, и FileComp работает как раньше. Если точка доступа не на `wlan0`, задайте `FILECOMP_HOTSPOT_IFACE`.
+2. Запустите с дополнительным файлом `docker-compose.hotspot.yml`. Он даёт контейнеру `NET_ADMIN` и монтирует файл аренд DHCP:
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.hotspot.yml up -d --build
+   ```
+
+   Чтобы не писать оба файла каждый раз, добавьте в `.env` строку `COMPOSE_FILE=docker-compose.yml:docker-compose.hotspot.yml`. Нужен Docker Compose 2.24 или новее.
+3. Откройте `http://10.42.0.1:8000/admin/hotspot` с устройства в сети `FileComp` или `http://192.168.7.2:8000/admin/hotspot` по USB. Ссылки на панель в основном интерфейсе нет. Войдите с паролем из `.env`.
+
+**Как это работает.** Раз в 3 секунды сервер читает `iw dev wlan0 station dump` и сравнивает список с предыдущим. IP и имя устройства берутся из файла аренд dnsmasq (`/var/lib/NetworkManager/dnsmasq-wlan0.leases`, путь меняется через `FILECOMP_HOTSPOT_LEASES`). «Отключить» сначала пробует `wpa_cli deauthenticate`, а если не вышло — `iw station del`. «Заблокировать» добавляет MAC в nftables (таблица `inet filecomp_hotspot`, правило `iifname wlan0 ether saddr @blocked drop`) и сразу отключает устройство. После перезагрузки Pi блок-лист восстанавливается в nftables при старте FileComp.
+
+Без `docker-compose.hotspot.yml` или без утилит `iw` и `nft` панель открывается, но показывает, чего не хватает. Остальной FileComp при этом работает как обычно.
+
+**Ограничения.**
+
+- Телефоны часто подключаются со случайным MAC-адресом (Android и iOS включают это по умолчанию для каждой сети, а иногда меняют адрес со временем). Блокировка по MAC такое устройство навсегда не остановит. Надёжный способ выгнать всех — сменить пароль точки доступа: `sudo nmcli connection modify FileComp wifi-sec.psk 'новый-пароль' && sudo nmcli connection up FileComp`.
+- Блокировка в nftables режет трафик к самой Pi, то есть к FileComp и DHCP. При этом устройство может снова подключиться к Wi-Fi и будет видно в списке. «Отключить» тоже действует только до следующего переподключения.
+- Пароль панели передаётся по HTTP без шифрования, как и всё в FileComp. Используйте отдельный пароль, не совпадающий с паролем Wi-Fi.
+- Если файл аренд недоступен для чтения пользователю контейнера (`PUID`), в панели не будет IP и имён: проверьте `ls -l /var/lib/NetworkManager/`.
 
 ---
 
@@ -398,6 +434,7 @@ Relay и GUI передают контейнер целиком в памяти,
 | `GET /api/transfers/{id}/download?compressed=true` | Архив `.fcmp`, поддерживает докачку |
 | `POST /api/transfers/{id}/verify` | Полная проверка архива |
 | `POST /api/archives?filename=` | Загрузить `.fcmp` «сырым» телом запроса; он станет передачей |
+| `/api/hotspot/*` | Админ-панель точки доступа: `GET clients`, `POST clients/{mac}/kick`, `GET`/`DELETE events`, `DELETE events/{id}`, `GET blocked`, `POST`/`DELETE blocked/{mac}`, `PUT labels/{mac}`. Только при заданном `FILECOMP_HOTSPOT_ADMIN_PASSWORD`, с заголовком `Authorization: Basic` (имя любое, пароль из `.env`) |
 | `POST /api/decompress` | Распаковать загруженный `.fcmp` (multipart), ответ — поток |
 | `GET /metrics` | Счётчики в формате Prometheus |
 
@@ -459,7 +496,8 @@ src/filecompression/
 ├── parallel.py      пул процессов для параллельного сжатия блоков
 ├── recommend.py     выбор алгоритма по выборке из файла
 ├── service.py       потоковые операции с файлами (используется CLI)
-├── web/             FastAPI: API, хранилище передач, определение LAN-адреса
+├── web/             FastAPI: API, хранилище передач, определение LAN-адреса, API админ-панели
+├── hotspot/         точка доступа: парсеры iw и аренд, журнал в SQLite, kick и nftables
 ├── transfer/        TCP relay: протокол, сервер, клиент
 ├── gui/             десктопный клиент на PySide6
 └── cli.py           консольный интерфейс
@@ -467,6 +505,7 @@ frontend/            React + Vite веб-интерфейс
 scripts/raspberry-pi/install.sh   установка на Pi
 docker-compose.yml               запуск в host-сети (Pi, Linux)
 docker-compose.bridge.yml        вариант для Docker Desktop
+docker-compose.hotspot.yml       права и монтирования для админ-панели точки доступа
 tests/, benchmarks/, docs/
 ```
 

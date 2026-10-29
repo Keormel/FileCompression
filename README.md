@@ -287,18 +287,16 @@ sudo nmcli connection delete FileComp    # удалить совсем
 **Как включить.**
 
 1. Задайте пароль в `.env`: `FILECOMP_HOTSPOT_ADMIN_PASSWORD=...`. Без пароля панель и её API отвечают 404, и FileComp работает как раньше. Если точка доступа не на `wlan0`, задайте `FILECOMP_HOTSPOT_IFACE`.
-2. Запустите с дополнительным файлом `docker-compose.hotspot.yml`. Он даёт контейнеру `NET_ADMIN` и монтирует файл аренд DHCP:
+2. Перезапустите FileComp. Панель поднимается вместе с сайтом из того же `docker-compose.yml`: он уже даёт контейнеру `NET_ADMIN` и монтирует файл аренд DHCP.
 
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.hotspot.yml up -d --build
+   docker compose up -d --build
    ```
-
-   Чтобы не писать оба файла каждый раз, добавьте в `.env` строку `COMPOSE_FILE=docker-compose.yml:docker-compose.hotspot.yml`. Нужен Docker Compose 2.24 или новее.
 3. Откройте `http://10.42.0.1:8000/admin/hotspot` с устройства в сети `FileComp` или `http://192.168.7.2:8000/admin/hotspot` по USB. Ссылки на панель в основном интерфейсе нет. Войдите с паролем из `.env`.
 
 **Как это работает.** Раз в 3 секунды сервер читает `iw dev wlan0 station dump` и сравнивает список с предыдущим. IP и имя устройства берутся из файла аренд dnsmasq (`/var/lib/NetworkManager/dnsmasq-wlan0.leases`, путь меняется через `FILECOMP_HOTSPOT_LEASES`). «Отключить» сначала пробует `wpa_cli deauthenticate`, а если не вышло — `iw station del`. «Заблокировать» добавляет MAC в nftables (таблица `inet filecomp_hotspot`, правило `iifname wlan0 ether saddr @blocked drop`) и сразу отключает устройство. После перезагрузки Pi блок-лист восстанавливается в nftables при старте FileComp.
 
-Без `docker-compose.hotspot.yml` или без утилит `iw` и `nft` панель открывается, но показывает, чего не хватает. Остальной FileComp при этом работает как обычно.
+Если не хватает прав или утилит `iw` и `nft` (например, FileComp запущен без Docker), панель открывается, но показывает, чего не хватает. Остальной FileComp при этом работает как обычно.
 
 **Ограничения.**
 
@@ -505,7 +503,6 @@ frontend/            React + Vite веб-интерфейс
 scripts/raspberry-pi/install.sh   установка на Pi
 docker-compose.yml               запуск в host-сети (Pi, Linux)
 docker-compose.bridge.yml        вариант для Docker Desktop
-docker-compose.hotspot.yml       права и монтирования для админ-панели точки доступа
 tests/, benchmarks/, docs/
 ```
 

@@ -32,7 +32,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 # Tools for the hotspot admin panel. iw and nft get the NET_ADMIN file capability so the non-root
 # app user can kick and block devices; it only takes effect when the container is granted
-# NET_ADMIN (docker-compose.hotspot.yml) and is inert otherwise.
+# NET_ADMIN (docker-compose.yml does) and is inert otherwise.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iw nftables wpasupplicant libcap2-bin \
     && setcap cap_net_admin+ep "$(command -v iw)" \

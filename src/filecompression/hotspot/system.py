@@ -59,7 +59,7 @@ def nft_script(iface: str, macs: Iterable[str]) -> str:
 def _permission_hint(stderr: str) -> str:
     lowered = stderr.lower()
     if "not permitted" in lowered or "permission denied" in lowered:
-        return " (no permission: the container needs cap_add NET_ADMIN, see docker-compose.hotspot.yml)"
+        return " (no permission: the container needs cap_add NET_ADMIN, see docker-compose.yml)"
     return ""
 
 

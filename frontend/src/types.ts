@@ -79,3 +79,46 @@ export type HotspotEvent = {
 }
 
 export type HotspotBlocked = { mac: string; blockedAt: number; label: string | null }
+
+type HotspotDevice = { mac: string | null; hostname: string | null; label: string | null }
+
+// An upload that is still arriving or a compression that is queued or running.
+export type HotspotLive = HotspotDevice & {
+  id: string
+  kind: 'upload' | 'compress'
+  client: string
+  filename: string
+  size: number | null
+  total: number | null
+  done: number
+  gzipped?: boolean
+  status?: string
+  algorithm?: string
+  startedAt: number
+  bytesPerSecond: number
+}
+
+export type HotspotActivityKind =
+  | 'upload'
+  | 'upload_failed'
+  | 'compressed'
+  | 'compress_failed'
+  | 'compress_cancelled'
+  | 'download'
+  | 'download_archive'
+  | 'archive_import'
+  | 'decompress'
+
+export type HotspotActivity = HotspotDevice & {
+  id: number
+  at: number
+  kind: HotspotActivityKind
+  ip: string
+  filename: string | null
+  size: number | null
+  compressedSize: number | null
+  sentBytes: number | null
+  algorithm: string | null
+  seconds: number | null
+  detail: string | null
+}

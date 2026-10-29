@@ -1,4 +1,4 @@
-import type { HotspotBlocked, HotspotClients, HotspotEvent } from './types'
+import type { HotspotActivity, HotspotBlocked, HotspotClients, HotspotEvent, HotspotLive } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 const AUTH_KEY = 'filecomp-hotspot-auth'
@@ -48,6 +48,10 @@ const mac = (value: string) => encodeURIComponent(value)
 export const hotspotApi = (auth: string) => ({
   clients: () => call<HotspotClients>(auth, '/clients'),
   events: (limit: number) => call<{ events: HotspotEvent[]; total: number }>(auth, `/events?limit=${limit}`),
+  activity: (limit: number) =>
+    call<{ live: HotspotLive[]; activity: HotspotActivity[]; total: number }>(auth, `/activity?limit=${limit}`),
+  deleteActivity: (id: number) => call(auth, `/activity/${id}`, { method: 'DELETE' }),
+  clearActivity: () => call<{ deleted: number }>(auth, '/activity', { method: 'DELETE' }),
   blocked: () => call<{ blocked: HotspotBlocked[]; error: string | null }>(auth, '/blocked'),
   kick: (value: string) => call<{ method: string }>(auth, `/clients/${mac(value)}/kick`, { method: 'POST' }),
   block: (value: string) => call<{ kicked: boolean }>(auth, `/blocked/${mac(value)}`, { method: 'POST' }),

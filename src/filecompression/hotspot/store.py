@@ -21,6 +21,22 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS labels (mac TEXT PRIMARY KEY, label TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS blocked (mac TEXT PRIMARY KEY, blocked_at REAL NOT NULL);
+-- Uploads, compressions and downloads, with the device resolved from its IP at the time.
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    kind TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    mac TEXT,
+    hostname TEXT,
+    filename TEXT,
+    size INTEGER,
+    compressed_size INTEGER,
+    sent_bytes INTEGER,
+    algorithm TEXT,
+    seconds REAL,
+    detail TEXT
+);
 -- Stations connected at the last poll, so a restart neither logs them again nor loses their disconnect.
 CREATE TABLE IF NOT EXISTS sessions (
     mac TEXT PRIMARY KEY,
@@ -75,6 +91,36 @@ class HotspotStore:
     def clear_events(self) -> int:
         with self.lock:
             return self.db.execute("DELETE FROM events").rowcount
+
+    # ------------------------------------------------------------ activity
+
+    ACTIVITY_FIELDS = ("filename", "size", "compressed_size", "sent_bytes", "algorithm", "seconds", "detail")
+
+    def add_activity(self, at: float, kind: str, ip: str, mac: str | None, hostname: str | None, **fields) -> int:
+        values = [fields.get(name) for name in self.ACTIVITY_FIELDS]
+        with self.lock:
+            cursor = self.db.execute(
+                f"INSERT INTO activity (at, kind, ip, mac, hostname, {', '.join(self.ACTIVITY_FIELDS)}) VALUES (?, ?, ?, ?, ?{', ?' * len(values)})",
+                (at, kind, ip, mac, hostname, *values),
+            )
+            return int(cursor.lastrowid)
+
+    def activity(self, limit: int, offset: int) -> tuple[list[dict], int]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT activity.*, labels.label FROM activity LEFT JOIN labels USING (mac) ORDER BY activity.id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            total = self.db.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
+        return [dict(row) for row in rows], total
+
+    def delete_activity(self, activity_id: int) -> bool:
+        with self.lock:
+            return self.db.execute("DELETE FROM activity WHERE id = ?", (activity_id,)).rowcount > 0
+
+    def clear_activity(self) -> int:
+        with self.lock:
+            return self.db.execute("DELETE FROM activity").rowcount
 
     # ------------------------------------------------------------ labels
 

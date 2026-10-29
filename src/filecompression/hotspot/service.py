@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .parsers import Lease, Station, diff_stations, parse_leases, parse_station_dump
@@ -32,6 +33,8 @@ class HotspotService:
         self.updated_at: float | None = None
         self.polls_since_flush = 0
         self.lock = threading.Lock()
+        # One writer thread keeps activity records in order and off the request path.
+        self.writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="filecompression-activity")
 
     def _read_leases(self) -> dict[str, Lease]:
         try:
@@ -102,6 +105,29 @@ class HotspotService:
             })
         return result
 
+    def who(self, ip: str) -> dict:
+        """The device behind an IP address, from the DHCP leases; empty for clients not on the hotspot."""
+        for mac, lease in list(self.identity.items()):
+            if lease.ip == ip:
+                return {"mac": mac, "hostname": lease.hostname}
+        return {"mac": None, "hostname": None}
+
+    def record_activity(self, record: dict) -> None:
+        """Queue one finished action (see web.activity.record) for the activity journal."""
+        self.writer.submit(self._write_activity, dict(record))
+
+    def _write_activity(self, record: dict) -> None:
+        try:
+            ip = record.pop("client")
+            device = self.who(ip)
+            self.store.add_activity(record.pop("at"), record.pop("kind"), ip, device["mac"], device["hostname"], **record)
+        except Exception:
+            logger.exception("cannot store activity")
+
+    def flush(self) -> None:
+        """Wait until every queued activity record is written."""
+        self.writer.submit(lambda: None).result()
+
     def kick(self, mac: str) -> str:
         return self.commands.kick(require_mac(mac))
 
@@ -137,6 +163,7 @@ class HotspotService:
             logger.warning("cannot restore the hotspot block list in nftables: %s", error)
 
     def close(self) -> None:
+        self.writer.shutdown(wait=True)
         with self.lock:
             self.store.save_sessions(self.current)
         self.store.close()

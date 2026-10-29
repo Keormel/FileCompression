@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from filecompression.hotspot import HotspotError, HotspotService, HotspotStore, SystemCommands, normalize_mac
+from filecompression.web import activity
 
 ADMIN_PASSWORD = os.getenv("FILECOMP_HOTSPOT_ADMIN_PASSWORD", "")
 IFACE = os.getenv("FILECOMP_HOTSPOT_IFACE", "").strip() or "wlan0"
@@ -50,6 +51,14 @@ def get_service() -> HotspotService:
             raise HTTPException(503, "FILECOMP_HOTSPOT_IFACE is not a valid interface name") from error
         service = HotspotService(HotspotStore(storage_dir / DATABASE_NAME), commands, LEASES_PATH)
     return service
+
+
+def _record_activity(record: dict) -> None:
+    if enabled():
+        get_service().record_activity(record)
+
+
+activity.sink = _record_activity
 
 
 def _password_from(header: str) -> str | None:
@@ -111,6 +120,25 @@ def _event_json(row: dict) -> dict:
     }
 
 
+def _activity_json(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "at": row["at"],
+        "kind": row["kind"],
+        "ip": row["ip"],
+        "mac": row["mac"],
+        "hostname": row["hostname"],
+        "label": row["label"],
+        "filename": row["filename"],
+        "size": row["size"],
+        "compressedSize": row["compressed_size"],
+        "sentBytes": row["sent_bytes"],
+        "algorithm": row["algorithm"],
+        "seconds": row["seconds"],
+        "detail": row["detail"],
+    }
+
+
 class LabelBody(BaseModel):
     label: str = Field("", max_length=64)
 
@@ -154,6 +182,29 @@ async def delete_event(event_id: int, hotspot: HotspotService = Depends(require_
 @router.delete("/events")
 async def clear_events(hotspot: HotspotService = Depends(require_admin)) -> dict:
     return {"deleted": await asyncio.to_thread(hotspot.store.clear_events)}
+
+
+@router.get("/activity")
+async def list_activity(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0), hotspot: HotspotService = Depends(require_admin)) -> dict:
+    rows, total = await asyncio.to_thread(hotspot.store.activity, limit, offset)
+    labels = await asyncio.to_thread(hotspot.store.labels)
+    live = []
+    for item in activity.live():
+        device = hotspot.who(item["client"])
+        live.append({**item, **device, "label": labels.get(device["mac"]) if device["mac"] else None})
+    return {"live": live, "activity": [_activity_json(row) for row in rows], "total": total}
+
+
+@router.delete("/activity/{activity_id}")
+async def delete_activity(activity_id: int, hotspot: HotspotService = Depends(require_admin)) -> dict:
+    if not await asyncio.to_thread(hotspot.store.delete_activity, activity_id):
+        raise HTTPException(404, "Activity record not found")
+    return {"deleted": 1}
+
+
+@router.delete("/activity")
+async def clear_activity(hotspot: HotspotService = Depends(require_admin)) -> dict:
+    return {"deleted": await asyncio.to_thread(hotspot.store.clear_activity)}
 
 
 @router.get("/blocked")

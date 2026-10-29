@@ -1,16 +1,19 @@
 import base64
 import subprocess
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 import filecompression.web.api as web_api
 import filecompression.web.hotspot as web_hotspot
+from filecompression.web import activity
 from filecompression.hotspot import (
     CONNECTED,
     DISCONNECTED,
     HotspotService,
     HotspotStore,
+    Lease,
     Station,
     SystemCommands,
     diff_stations,
@@ -279,3 +282,65 @@ def test_api_reports_missing_tools_without_breaking_the_app(api, system) -> None
     system.failing.add("nft")
     assert "NET_ADMIN" in api.post("/api/hotspot/blocked/aa:bb:cc:dd:ee:ff").json()["detail"]
     assert api.get("/api/health").status_code == 200
+
+
+def _wait_for_compression(client: TestClient, operation_id: str) -> dict:
+    for _ in range(200):
+        status = client.get(f"/api/compress/{operation_id}/status").json()
+        if status["status"] in {"completed", "error", "cancelled"}:
+            return status
+        time.sleep(0.02)
+    raise AssertionError("compression did not finish")
+
+
+def test_activity_feed_records_uploads_compressions_and_downloads(api, hotspot, system) -> None:
+    # TestClient requests come from the address "testclient"; pretend it is the phone's lease.
+    hotspot.identity["3a:f1:0c:22:9b:01"] = Lease("3a:f1:0c:22:9b:01", "testclient", "Pixel-7", 0)
+    api.put("/api/hotspot/labels/3a:f1:0c:22:9b:01", json={"label": "телефон Саши"})
+    data = b"hello hotspot " * 2000
+    started = api.post("/api/compress/stream?filename=notes.txt&algorithm=lzw", content=data, headers={"Content-Type": "application/octet-stream"})
+    assert started.status_code == 200
+    transfer_id = _wait_for_compression(api, started.json()["operationId"])["transferId"]
+    assert api.get(f"/api/transfers/{transfer_id}/download?compressed=true").status_code == 200
+    assert api.get(f"/api/transfers/{transfer_id}/download", headers={"Range": "bytes=10-"}).status_code in {200, 206}
+    hotspot.flush()
+
+    feed = api.get("/api/hotspot/activity").json()
+    kinds = [item["kind"] for item in feed["activity"]]
+    assert kinds == [activity.DOWNLOAD_ARCHIVE, activity.COMPRESSED, activity.UPLOAD]  # newest first; the Range resume is not logged again
+    upload = feed["activity"][-1]
+    assert (upload["filename"], upload["size"], upload["sentBytes"], upload["algorithm"]) == ("notes.txt", len(data), len(data), "lzw")
+    assert (upload["mac"], upload["hostname"], upload["label"]) == ("3a:f1:0c:22:9b:01", "Pixel-7", "телефон Саши")
+    compressed = feed["activity"][1]
+    assert compressed["size"] == len(data) and 0 < compressed["compressedSize"] < len(data)
+    assert feed["live"] == []
+
+    assert api.delete(f"/api/hotspot/activity/{feed['activity'][0]['id']}").status_code == 200
+    assert api.delete("/api/hotspot/activity").json() == {"deleted": 2}
+
+
+def test_activity_feed_records_failed_upload(api, hotspot) -> None:
+    response = api.post("/api/compress/stream?filename=bad.txt&encoding=gzip", content=b"not gzip at all", headers={"Content-Type": "application/octet-stream"})
+    assert response.status_code == 400
+    hotspot.flush()
+    failed = api.get("/api/hotspot/activity").json()["activity"][0]
+    assert (failed["kind"], failed["filename"], failed["sentBytes"]) == (activity.UPLOAD_FAILED, "bad.txt", 15)
+    assert "gzip" in failed["detail"]
+
+
+def test_activity_shows_uploads_in_progress(api) -> None:
+    upload = activity.start_upload("testclient", "movie.mp4", size=10_000, body_size=10_000, gzipped=False)
+    upload.received = 2_500
+    try:
+        live = api.get("/api/hotspot/activity").json()["live"]
+        assert [(item["kind"], item["filename"], item["done"], item["total"]) for item in live] == [(activity.UPLOAD, "movie.mp4", 2_500, 10_000)]
+    finally:
+        activity.finish_upload(upload)
+
+
+def test_activity_is_not_stored_while_panel_is_disabled(monkeypatch, hotspot) -> None:
+    monkeypatch.setattr(web_hotspot, "ADMIN_PASSWORD", "")
+    monkeypatch.setattr(web_hotspot, "service", hotspot)
+    activity.record("10.42.0.57", activity.UPLOAD, filename="a.txt", size=1)
+    hotspot.flush()
+    assert hotspot.store.activity(10, 0)[1] == 0

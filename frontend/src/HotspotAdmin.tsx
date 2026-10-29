@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { HotspotApiError, basicAuth, hotspotApi, saveAuth, savedAuth } from "./hotspotApi";
-import type { HotspotBlocked, HotspotClients, HotspotEvent } from "./types";
+import type { HotspotActivity, HotspotActivityKind, HotspotBlocked, HotspotClients, HotspotEvent, HotspotLive } from "./types";
 
 const REFRESH_MS = 5000;
+// While someone is uploading or compressing, refresh faster so progress moves smoothly.
+const LIVE_REFRESH_MS = 2000;
 const EVENTS_PAGE = 50;
 
 const bytes = (value: number | null) =>
@@ -37,6 +39,42 @@ const time = (epochSeconds: number) =>
 // The label replaces the hostname everywhere; the MAC is the last resort.
 const nameOf = (item: { label: string | null; hostname?: string | null; mac: string }) =>
   item.label ?? item.hostname ?? "Без имени";
+
+// Devices outside the hotspot (Ethernet, USB) have no lease, so their IP is the name.
+const deviceName = (item: { label: string | null; hostname: string | null; mac: string | null; ip?: string; client?: string }) =>
+  item.label ?? item.hostname ?? item.ip ?? item.client ?? "—";
+
+const ACTIONS: Record<HotspotActivityKind, { text: string; tone: "on" | "off" | "info" }> = {
+  upload: { text: "загрузил файл", tone: "on" },
+  upload_failed: { text: "загрузка не удалась", tone: "off" },
+  compressed: { text: "сжал файл", tone: "on" },
+  compress_failed: { text: "ошибка сжатия", tone: "off" },
+  compress_cancelled: { text: "отменил сжатие", tone: "off" },
+  download: { text: "скачал файл", tone: "info" },
+  download_archive: { text: "скачал архив", tone: "info" },
+  archive_import: { text: "открыл архив", tone: "info" },
+  decompress: { text: "распаковал архив", tone: "info" },
+};
+
+const liveAction = (item: HotspotLive) =>
+  item.kind === "upload" ? "загружает" : item.status === "queued" ? "ждёт сжатия" : "сжимает";
+
+const percent = (item: HotspotLive) => (item.total ? Math.min(100, (item.done / item.total) * 100) : null);
+
+const activityDetails = (item: HotspotActivity) => {
+  const parts: string[] = [];
+  if (item.kind === "compressed" && item.size != null && item.compressedSize != null) {
+    const saved = item.size ? (1 - item.compressedSize / item.size) * 100 : 0;
+    parts.push(`→ ${bytes(item.compressedSize)} (${saved >= 0 ? "−" : "+"}${Math.abs(saved).toFixed(1)}%)`);
+    if (item.seconds != null) parts.push(`за ${item.seconds < 1 ? `${Math.round(item.seconds * 1000)} мс` : `${item.seconds.toFixed(1)} с`}`);
+  }
+  if (item.algorithm) parts.push(item.algorithm.toUpperCase());
+  // A gzip upload sends fewer bytes over Wi-Fi than the file has.
+  if (item.sentBytes != null && item.size != null && item.sentBytes < item.size) parts.push(`передано ${bytes(item.sentBytes)} (gzip)`);
+  if (item.kind === "upload_failed" && item.sentBytes != null) parts.push(`передано ${bytes(item.sentBytes)}`);
+  if (item.detail) parts.push(item.detail);
+  return parts.join("; ") || "—";
+};
 
 // rx/tx are counted by the access point: rx is what the device sent, tx what it received.
 const Traffic = ({ rx, tx }: { rx: number | null; tx: number | null }) => (
@@ -85,6 +123,10 @@ export default function HotspotAdmin() {
   const [events, setEvents] = useState<HotspotEvent[]>([]);
   const [eventsTotal, setEventsTotal] = useState(0);
   const [eventLimit, setEventLimit] = useState(EVENTS_PAGE);
+  const [live, setLive] = useState<HotspotLive[]>([]);
+  const [activity, setActivity] = useState<HotspotActivity[]>([]);
+  const [activityTotal, setActivityTotal] = useState(0);
+  const [activityLimit, setActivityLimit] = useState(EVENTS_PAGE);
   const [error, setError] = useState("");
   const [pending, setPending] = useState<string>();
 
@@ -108,8 +150,16 @@ export default function HotspotAdmin() {
     if (!auth) return;
     const api = hotspotApi(auth);
     try {
-      const [current, block, journal] = await Promise.all([api.clients(), api.blocked(), api.events(eventLimit)]);
+      const [current, block, journal, feed] = await Promise.all([
+        api.clients(),
+        api.blocked(),
+        api.events(eventLimit),
+        api.activity(activityLimit),
+      ]);
       setClients(current);
+      setLive(feed.live);
+      setActivity(feed.activity);
+      setActivityTotal(feed.total);
       setBlocked(block.blocked);
       setFirewallError(block.error);
       setEvents(journal.events);
@@ -118,14 +168,15 @@ export default function HotspotAdmin() {
     } catch (cause) {
       fail(cause);
     }
-  }, [auth, eventLimit, fail]);
+  }, [auth, eventLimit, activityLimit, fail]);
 
+  const busy = live.length > 0;
   useEffect(() => {
     if (!auth) return;
     refresh();
-    const timer = setInterval(refresh, REFRESH_MS);
+    const timer = setInterval(refresh, busy ? LIVE_REFRESH_MS : REFRESH_MS);
     return () => clearInterval(timer);
-  }, [auth, refresh]);
+  }, [auth, refresh, busy]);
 
   if (!auth) {
     return (
@@ -191,6 +242,7 @@ export default function HotspotAdmin() {
                 <th>Сигнал</th>
                 <th>Подключён</th>
                 <th>Трафик</th>
+                <th>Сейчас</th>
                 <th />
               </tr>
             </thead>
@@ -209,6 +261,16 @@ export default function HotspotAdmin() {
                   <td title={time(client.connectedAt)}>{duration(client.connectedSeconds)}</td>
                   <td className="mono">
                     <Traffic rx={client.rxBytes} tx={client.txBytes} />
+                  </td>
+                  <td>
+                    {live
+                      .filter((item) => item.mac === client.mac)
+                      .map((item) => (
+                        <div key={item.id} className="now-doing">
+                          {liveAction(item)} <b>{item.filename}</b>
+                          {percent(item) != null && ` ${percent(item)!.toFixed(0)}%`}
+                        </div>
+                      ))}
                   </td>
                   <td className="actions">
                     <button disabled={!!pending} onClick={() => act(`kick-${client.mac}`, () => api.kick(client.mac))}>
@@ -231,6 +293,116 @@ export default function HotspotAdmin() {
           </table>
           {clients && !clients.clients.length && <div className="empty-metrics">Никто не подключён.</div>}
         </div>
+      </section>
+
+      <section className="panel admin-section">
+        <span className="eyebrow">СЕЙЧАС НА СЕРВЕРЕ</span>
+        <h2>{live.length ? `${live.length} ${live.length === 1 ? "операция" : "операций"}` : "Тихо"}</h2>
+        {live.length ? (
+          <div className="table-scroll">
+            <table className="admin-table">
+              <thead>
+                <tr>
+                  <th>Устройство</th>
+                  <th>Действие</th>
+                  <th>Файл</th>
+                  <th>Размер</th>
+                  <th>Прогресс</th>
+                  <th>Скорость</th>
+                </tr>
+              </thead>
+              <tbody>
+                {live.map((item) => (
+                  <tr key={item.id}>
+                    <td>
+                      <b>{deviceName(item)}</b>
+                      <small className="mono muted">{item.mac ?? item.client}</small>
+                    </td>
+                    <td>{liveAction(item)}</td>
+                    <td className="filename" title={item.filename}>{item.filename}</td>
+                    <td className="mono">{bytes(item.size)}</td>
+                    <td className="progress-cell">
+                      <progress value={item.done} max={Math.max(item.total ?? 0, 1)} />
+                      <span className="mono">
+                        {bytes(item.done)}
+                        {item.total ? ` / ${bytes(item.total)} (${percent(item)!.toFixed(0)}%)` : ""}
+                      </span>
+                    </td>
+                    <td className="mono">{item.bytesPerSecond ? `${bytes(Math.round(item.bytesPerSecond))}/s` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty-metrics">Сейчас никто ничего не загружает и не сжимает.</div>
+        )}
+      </section>
+
+      <section className="panel admin-section">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">АКТИВНОСТЬ</span>
+            <h2>{activityTotal} записей</h2>
+          </div>
+          <button
+            className="danger"
+            disabled={!!pending || !activityTotal}
+            onClick={() => {
+              if (window.confirm(`Удалить все ${activityTotal} записей активности? Это нельзя отменить.`))
+                act("clear-activity", () => api.clearActivity());
+            }}
+          >
+            Очистить активность
+          </button>
+        </div>
+        <div className="table-scroll">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Время</th>
+                <th>Устройство</th>
+                <th>Действие</th>
+                <th>Файл</th>
+                <th>Размер</th>
+                <th>Подробности</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {activity.map((item) => (
+                <tr key={item.id}>
+                  <td>{time(item.at)}</td>
+                  <td>
+                    <b>{deviceName(item)}</b>
+                    <small className="mono muted">{item.mac ?? item.ip}</small>
+                  </td>
+                  <td>
+                    <span className={`event-tag ${ACTIONS[item.kind]?.tone ?? "info"}`}>{ACTIONS[item.kind]?.text ?? item.kind}</span>
+                  </td>
+                  <td className="filename" title={item.filename ?? ""}>{item.filename ?? "—"}</td>
+                  <td className="mono">{bytes(item.size)}</td>
+                  <td className="details">{activityDetails(item)}</td>
+                  <td className="actions">
+                    <button
+                      className="link-button"
+                      disabled={!!pending}
+                      onClick={() => act(`activity-${item.id}`, () => api.deleteActivity(item.id))}
+                    >
+                      удалить
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!activity.length && <div className="empty-metrics">Пока никто ничего не загружал и не скачивал.</div>}
+        </div>
+        {activity.length < activityTotal && (
+          <button className="primary full" onClick={() => setActivityLimit((limit) => limit + EVENTS_PAGE)}>
+            Показать ещё
+          </button>
+        )}
       </section>
 
       <section className="panel admin-section">

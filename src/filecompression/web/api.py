@@ -31,6 +31,7 @@ from filecompression.container.format import MAX_ORIGINAL_SIZE, validate_filenam
 from filecompression.errors import CompressionError, OperationCancelled
 from filecompression.recommend import recommend, recommend_file
 from filecompression.transfer import TransferClient
+from filecompression.web import activity
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -136,6 +137,8 @@ class CompressionOperation:
     created_at: float = field(default_factory=time.time)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     reservation: str | None = None
+    # Address of the device that uploaded the file, for the admin panel's activity feed.
+    client: str = ""
 
     @property
     def finished(self) -> bool:
@@ -311,7 +314,7 @@ class _UploadWriter:
             raise HTTPException(400, "Gzip upload is truncated")
 
 
-async def _write_stream(chunks: AsyncIterator[bytes], *, gzipped: bool = False) -> Path:
+async def _write_stream(chunks: AsyncIterator[bytes], *, gzipped: bool = False, live: activity.LiveUpload | None = None) -> Path:
     """Stream an upload to disk in 1 MiB writes, enforcing the size limit while it arrives."""
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     path = STORAGE_DIR / f"upload-{uuid.uuid4().hex}.tmp"
@@ -322,6 +325,8 @@ async def _write_stream(chunks: AsyncIterator[bytes], *, gzipped: bool = False) 
             writer = _UploadWriter(handle, gzipped)
             async for chunk in chunks:
                 received += len(chunk)
+                if live is not None:
+                    live.received = received
                 # The encoded body of a real file is never larger than the file itself.
                 if received > MAX_UPLOAD_SIZE + 64 * 1024:
                     raise HTTPException(413, "File exceeds the configured upload limit")
@@ -363,15 +368,32 @@ def _declared_length(request: Request) -> int | None:
         return None
 
 
-async def _receive_upload(request: Request, chunks: AsyncIterator[bytes], *, expected_size: int | None = None, gzipped: bool = False) -> tuple[Path, str]:
-    """Admit, then store an upload. Returns the file and its reservation, which the caller must release."""
+def _client_address(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+async def _receive_upload(
+    request: Request,
+    chunks: AsyncIterator[bytes],
+    *,
+    filename: str,
+    kind: str = activity.UPLOAD,
+    details: dict | None = None,
+    expected_size: int | None = None,
+    gzipped: bool = False,
+) -> tuple[Path, str]:
+    """Admit, then store an upload. Returns the file and its reservation, which the caller must release.
+
+    The upload shows up live in the admin panel while it arrives and is recorded there as `kind`
+    once stored, or as a failed upload.
+    """
     declared = _declared_length(request)
     if declared is not None and declared > MAX_UPLOAD_SIZE + 64 * 1024:
         raise HTTPException(413, "File exceeds the configured upload limit")
     expected = expected_size if expected_size is not None else (declared or 0)
     if expected > MAX_UPLOAD_SIZE:
         raise HTTPException(413, "File exceeds the configured upload limit")
-    client = request.client.host if request.client else "unknown"
+    client = _client_address(request)
     if client_uploads.get(client, 0) >= MAX_UPLOADS_PER_CLIENT:
         raise HTTPException(429, "This device already has uploads in progress; wait for them to finish", headers={"Retry-After": "10"})
     token = _reserve(expected)
@@ -381,14 +403,22 @@ async def _receive_upload(request: Request, chunks: AsyncIterator[bytes], *, exp
             await asyncio.wait_for(upload_slots.acquire(), UPLOAD_SLOT_WAIT_SECONDS)
         except TimeoutError:
             raise _busy("All upload slots are in use; try again in a minute") from None
+        live = activity.start_upload(client, filename, size=expected_size, body_size=declared, gzipped=gzipped)
         try:
-            path = await _write_stream(_until_idle(chunks), gzipped=gzipped)
-        except ClientDisconnect:
-            # Routine on Wi-Fi and hotspots; not worth an ERROR traceback in the log.
-            logger.info("upload interrupted: client %s disconnected", client)
-            raise HTTPException(400, "Upload interrupted: the client disconnected") from None
+            try:
+                path = await _write_stream(_until_idle(chunks), gzipped=gzipped, live=live)
+            except ClientDisconnect:
+                # Routine on Wi-Fi and hotspots; not worth an ERROR traceback in the log.
+                logger.info("upload interrupted: client %s disconnected", client)
+                raise HTTPException(400, "Upload interrupted: the client disconnected") from None
+        except BaseException as error:
+            reason = error.detail if isinstance(error, HTTPException) else "Upload interrupted"
+            activity.record(client, activity.UPLOAD_FAILED, filename=filename, size=expected_size, sent_bytes=live.received, detail=reason)
+            raise
         finally:
+            activity.finish_upload(live)
             upload_slots.release()
+        activity.record(client, kind, filename=filename, size=path.stat().st_size, sent_bytes=live.received, **(details or {}))
     except BaseException:
         _release(token)
         raise
@@ -483,26 +513,29 @@ def _run_compression(operation: CompressionOperation, upload_path: Path) -> None
             operation.compression_time = transfer.compression_time
             operation.status = "completed"
         metrics["uploads_completed"] += 1
+        activity.record(operation.client, activity.COMPRESSED, filename=operation.filename, size=transfer.info.original_size, compressed_size=transfer.info.compressed_size, algorithm=algorithm, seconds=transfer.compression_time)
         logger.info("compression finished id=%s transfer=%s %d -> %d bytes in %.1fs", operation.identifier, transfer.identifier, transfer.info.original_size, transfer.info.compressed_size, transfer.compression_time)
     except OperationCancelled as error:
         with operation_lock:
             operation.status = "cancelled"
             operation.error = str(error)
         metrics["uploads_cancelled"] += 1
+        activity.record(operation.client, activity.COMPRESS_CANCELLED, filename=operation.filename, size=operation.total_bytes)
     except Exception as error:
         message = error.detail if isinstance(error, HTTPException) else str(error)
         with operation_lock:
             operation.status = "error"
             operation.error = message
         logger.error("compression failed id=%s: %s", operation.identifier, message)
+        activity.record(operation.client, activity.COMPRESS_FAILED, filename=operation.filename, size=operation.total_bytes, detail=message)
         metrics["uploads_failed"] += 1
     finally:
         upload_path.unlink(missing_ok=True)
         _release(operation.reservation)
 
 
-def _start_operation(upload_path: Path, filename: str, algorithm: str, reservation: str) -> dict:
-    operation = CompressionOperation(uuid.uuid4().hex, filename, upload_path.stat().st_size, algorithm, reservation=reservation)
+def _start_operation(upload_path: Path, filename: str, algorithm: str, reservation: str, client: str) -> dict:
+    operation = CompressionOperation(uuid.uuid4().hex, filename, upload_path.stat().st_size, algorithm, reservation=reservation, client=client)
     with operation_lock:
         # The real size replaces the client's estimate until the transfer is registered.
         if reservation in reservations:
@@ -829,6 +862,28 @@ def create_app():
     def active_operations() -> int:
         return sum(operation.status in {"queued", "processing", "cancelling"} for operation in operations.values())
 
+    def live_compressions() -> list[dict]:
+        with operation_lock:
+            running = [operation for operation in operations.values() if operation.status in {"queued", "processing", "cancelling"}]
+            return [
+                {
+                    "id": operation.identifier,
+                    "kind": "compress",
+                    "client": operation.client,
+                    "filename": operation.filename,
+                    "size": operation.total_bytes,
+                    "total": operation.total_bytes,
+                    "done": operation.processed_bytes,
+                    "status": operation.status,
+                    "algorithm": operation.algorithm,
+                    "startedAt": operation.created_at,
+                    "bytesPerSecond": operation.speed,
+                }
+                for operation in running
+            ]
+
+    activity.live_operations = live_compressions
+
     @app.get("/api/health")
     async def health() -> dict:
         return {
@@ -879,8 +934,8 @@ def create_app():
     async def start_compression(request: Request, file: UploadFile = File(...), algorithm: str = Form(AUTO_ALGORITHM)) -> dict:
         filename = _validated_filename(file.filename)
         algorithm = _validated_algorithm(algorithm)
-        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
-        return _start_operation(upload_path, filename, algorithm, reservation)
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file), filename=filename, details={"algorithm": algorithm})
+        return _start_operation(upload_path, filename, algorithm, reservation, _client_address(request))
 
     @app.post("/api/compress/stream")
     async def start_stream_compression(
@@ -900,8 +955,8 @@ def create_app():
         algorithm = _validated_algorithm(algorithm)
         if encoding not in {"identity", "gzip"}:
             raise HTTPException(400, f"Unsupported upload encoding: {encoding}")
-        upload_path, reservation = await _receive_upload(request, request.stream(), expected_size=size, gzipped=encoding == "gzip")
-        return _start_operation(upload_path, filename, algorithm, reservation)
+        upload_path, reservation = await _receive_upload(request, request.stream(), filename=filename, details={"algorithm": algorithm}, expected_size=size, gzipped=encoding == "gzip")
+        return _start_operation(upload_path, filename, algorithm, reservation, _client_address(request))
 
     @app.get("/api/compress/{identifier}/status")
     async def compression_status(identifier: str) -> dict:
@@ -926,7 +981,7 @@ def create_app():
     async def create_transfer(request: Request, file: UploadFile = File(...), algorithm: str = Form(...)) -> dict:
         filename = _validated_filename(file.filename)
         algorithm = _validated_algorithm(algorithm)
-        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file), filename=filename, details={"algorithm": algorithm})
         loop = asyncio.get_running_loop()
         try:
             # Same bounded pool as background compressions, so this endpoint cannot bypass the CPU limit.
@@ -938,12 +993,13 @@ def create_app():
         finally:
             upload_path.unlink(missing_ok=True)
             _release(reservation)
+        activity.record(_client_address(request), activity.COMPRESSED, filename=filename, size=transfer.info.original_size, compressed_size=transfer.info.compressed_size, algorithm=transfer.info.algorithm, seconds=transfer.compression_time)
         return _metadata(transfer.identifier, transfer)
 
     @app.post("/api/archives")
     async def import_archive(request: Request, filename: str = Query("archive.fcmp")) -> dict:
         """Store an uploaded .fcmp as a transfer so its restored file can be downloaded as a stream."""
-        upload_path, reservation = await _receive_upload(request, request.stream())
+        upload_path, reservation = await _receive_upload(request, request.stream(), filename=filename, kind=activity.ARCHIVE_IMPORT)
         try:
             info = await asyncio.to_thread(read_info_path, upload_path)
             identifier = secrets.token_urlsafe(8)
@@ -961,10 +1017,16 @@ def create_app():
         return _metadata(identifier, _get_transfer(identifier))
 
     @app.get("/api/transfers/{identifier}/download")
-    async def download(identifier: str, compressed: bool = False) -> Response:
+    async def download(request: Request, identifier: str, compressed: bool = False) -> Response:
         """Return the original file (restored and SHA-256 checked while streaming) or, with ?compressed=true, the FCMP archive."""
         transfer = _get_transfer(identifier)
         info = transfer.info
+        # A resumed download (Range request) continues one that is already in the feed.
+        if "range" not in request.headers:
+            if compressed:
+                activity.record(_client_address(request), activity.DOWNLOAD_ARCHIVE, filename=_compressed_name(info.filename), size=info.compressed_size)
+            else:
+                activity.record(_client_address(request), activity.DOWNLOAD, filename=info.filename, size=info.original_size)
         if compressed:
             transfer.downloaded = True
             return FileResponse(transfer.container_path, media_type="application/octet-stream", headers={"Content-Disposition": _attachment(_compressed_name(info.filename)), "X-Checksum": info.checksum})
@@ -981,7 +1043,7 @@ def create_app():
 
     @app.post("/api/decompress")
     async def decompress_upload(request: Request, file: UploadFile = File(...)) -> Response:
-        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file), filename=file.filename or "archive.fcmp", kind=activity.DECOMPRESS)
         # The archive is deleted once it has been streamed back; nothing is stored for long.
         _release(reservation)
         try:
@@ -1039,7 +1101,7 @@ def create_app():
         if client is None:
             raise HTTPException(404, "Session not found")
         filename = _validated_filename(file.filename)
-        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file))
+        upload_path, reservation = await _receive_upload(request, _multipart_chunks(file), filename=filename)
         try:
             from filecompression.container import pack
 

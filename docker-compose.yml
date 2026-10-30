@@ -8,7 +8,10 @@ services:
     build: .
     image: filecompression:latest
     container_name: filecompression
-    restart: unless-stopped
+    # Started whenever the Docker daemon starts, even after a manual stop. Booting needs no
+    # internet: the image is local (scripts/raspberry-pi/enable-autostart.sh also recreates the
+    # container at boot if it was removed with `docker compose down`).
+    restart: always
     init: true
     # Host networking lets the app see the real LAN interfaces (eth0 / wlan0) instead of a
     # Docker bridge, so /api/network-info, share links and QR codes carry the LAN address,

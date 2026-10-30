@@ -63,5 +63,9 @@ for address in $(hostname -I); do
 done
 echo "    http://$(hostname).local${SUFFIX}   (mDNS, if avahi-daemon is running)"
 echo
+
+./scripts/raspberry-pi/enable-autostart.sh
+
+echo
 echo "Logs:    $DOCKER compose logs -f"
-echo "Stop:    $DOCKER compose down"
+echo "Stop:    sudo systemctl stop filecomp   (starts again on the next boot)"

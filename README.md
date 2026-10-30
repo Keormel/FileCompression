@@ -169,15 +169,31 @@ curl http://localhost/api/health
 |---|---|
 | Статус | `docker compose ps` |
 | Логи | `docker compose logs -f` |
-| Остановить | `docker compose down` |
-| Запустить | `docker compose up -d` |
+| Остановить до следующей загрузки | `sudo systemctl stop filecomp` |
+| Запустить | `sudo systemctl start filecomp` (или `docker compose up -d`) |
+| Отключить автозапуск | `sudo systemctl disable filecomp` и `docker compose down` |
 | Перезапустить после правки `.env` | `docker compose up -d` |
 | Обновить до новой версии | `git pull && docker compose up -d --build` |
 | Состояние и свободное место | `curl localhost/api/health` |
 | Метрики (формат Prometheus) | `curl localhost/metrics` |
 | Удалить все передачи | `docker compose down && rm -f data/*.fcmp && docker compose up -d` |
 
-Контейнер запускается вместе с Pi автоматически (`restart: unless-stopped`).
+### Автозапуск без интернета
+
+Интернет нужен только один раз — для сборки образа (`docker compose up -d --build` скачивает базовые образы и пакеты). Дальше FileComp поднимается после каждой перезагрузки сам, даже если интернета нет, а Wi-Fi занят точкой доступа:
+
+- в `docker-compose.yml` стоит `restart: always`: Docker запускает контейнер при каждом своём старте, даже если его останавливали вручную;
+- systemd-служба `filecomp` при загрузке выполняет `docker compose up -d --no-build --pull never`. Она берёт только образ, который уже есть на Pi, никогда не обращается к Docker Hub и не ждёт сети. Если контейнер удалили через `docker compose down`, служба создаст его заново.
+
+`install.sh` включает службу сам. Если FileComp уже установлен, включите её один раз из каталога проекта:
+
+```bash
+./scripts/raspberry-pi/enable-autostart.sh
+```
+
+Проверка: `sudo reboot` при выключенном интернете, затем `systemctl status filecomp` и `docker compose ps`. Чтобы после перезагрузки поднималась и точка доступа, включите ей автоподключение: `sudo nmcli connection modify FileComp connection.autoconnect yes`.
+
+После `git pull` образ нужно пересобрать с интернетом (`docker compose up -d --build`). До этого после перезагрузки запускается старая версия.
 
 ---
 
@@ -525,6 +541,8 @@ tests/, benchmarks/, docs/
 | `.local` не открывается | Android и Windows поддерживают mDNS не всегда — используйте IP. На Pi проверьте `systemctl status avahi-daemon` |
 | Контейнер перезапускается, в логе `Permission denied` | Каталог данных не принадлежит `PUID:PGID`: `sudo chown -R $(id -u):$(id -g) data` |
 | Контейнер не стартует, в логе `address already in use` | Порт 80 на Pi занят другим веб-сервером (`sudo ss -ltnp 'sport = :80'` покажет, каким). Остановите его или задайте `FILECOMP_WEB_PORT=8000` в `.env`; тогда адрес будет `http://<адрес>:8000` |
+| После перезагрузки сайт появляется только через 1–2 минуты | Docker ждёт `network-online.target`. На Ubuntu, где сетью управляет NetworkManager, эту задержку часто даёт ненужная служба `systemd-networkd-wait-online`; проверьте `systemd-analyze blame \| head` и, если она там, отключите: `sudo systemctl disable systemd-networkd-wait-online` |
+| После перезагрузки не стартует, в `journalctl -u filecomp` ошибка про образ | Образ удалён (например, `docker system prune -a`). Соберите его заново с интернетом: `docker compose up -d --build` |
 | Ошибка 413 | Файл больше `FILECOMP_MAX_UPLOAD_BYTES` |
 | «Server is busy», ошибка 503 | Сервер загружен. Страница повторяет попытку сама. Если такое бывает часто, увеличьте `FILECOMP_MAX_PENDING_JOBS` и `FILECOMP_MAX_CONCURRENT_UPLOADS` |
 | Ошибка 429 | С этого устройства уже идут `FILECOMP_MAX_UPLOADS_PER_CLIENT` загрузки, либо превышен rate limit |
